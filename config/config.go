@@ -118,7 +118,6 @@ type Config struct {
 	P2P           P2PConfig           `mapstructure:"p2p"`
 	Health        HealthConfig        `mapstructure:"health"`
 	Propagation   PropagationConfig   `mapstructure:"propagation"`
-	TxValidator   TxValidatorConfig   `mapstructure:"tx_validator"`
 	BumpBuilder   BumpBuilderConfig   `mapstructure:"bump_builder"`
 	Watchdog      WatchdogConfig      `mapstructure:"watchdog"`
 	SSE           SSEConfig           `mapstructure:"sse"`
@@ -165,11 +164,13 @@ type Kafka struct {
 	ConsumerGroup string   `mapstructure:"consumer_group"`
 	MaxRetries    int      `mapstructure:"max_retries"`
 	BufferSize    int      `mapstructure:"buffer_size"`
-	// MinPartitions is the minimum number of partitions every hot-path topic
-	// must have at startup. Set to the expected replica count of the largest
-	// horizontally-scaled consumer (tx-validator or propagation) so arcade
-	// fails fast when the cluster can't actually fan out across pods. Leave
-	// at 0 or 1 in standalone/single-replica deployments.
+	// MinPartitions is a soft minimum-partition hint for horizontally-scaled
+	// topics; arcade fails fast at startup when an existing topic has fewer.
+	// Independent of this knob, TopicPropagation is ALWAYS checked for an
+	// exact partition count of 1 — the dep-aware dispatcher's single-goroutine
+	// state ownership requires total order at the topic level, so multiple
+	// partitions would reintroduce the cross-batch "missing inputs" race.
+	// Leave at 0 or 1 in standalone/single-replica deployments.
 	MinPartitions int `mapstructure:"min_partitions"`
 	// SendTimeoutMs bounds how long the in-process memory broker waits for a
 	// slot in a full mailbox before returning ErrBrokerBackpressure to the
@@ -345,12 +346,15 @@ type PropagationConfig struct {
 	// otherwise pin merkle-service at its postgres write ceiling for hours.
 	// Issue #145.
 	MerkleReplayRPS int `mapstructure:"merkle_replay_rps"`
-	// MaxPending caps the in-memory pending-batch slice the propagation
-	// consumer accumulates between flushes. Once full, new messages are
-	// returned as errors from handleMessage so the Kafka consumer's
-	// retry+DLQ machinery sheds load instead of growing the slice to OOM.
-	// Defaults to 50000 — large enough to absorb a multi-minute downstream
-	// stall at 50 TPS without dropping, small enough to bound memory.
+	// MaxPending caps the dispatcher's pending-batch slice — the
+	// broadcast-bound queue that accumulates between flushes. When
+	// the slice reaches this size, the dispatcher stops accepting
+	// new admits from Kafka; handleMessage's channel send blocks,
+	// the Kafka consumer goroutine pauses pulls, and backpressure
+	// flows back to the broker. Held waiters do NOT count (they're
+	// in a separate map). Defaults to 50000 — large enough to
+	// absorb a multi-minute downstream stall at 50 TPS without
+	// blocking the consumer, small enough to bound memory.
 	MaxPending int `mapstructure:"max_pending"`
 	// MaxConcurrentBatches caps how many flushed batches run their
 	// register+broadcast pipeline concurrently. With concurrency=1 (the
@@ -365,7 +369,7 @@ type PropagationConfig struct {
 	// pipeline times without flooding merkle-service or teranode.
 	MaxConcurrentBatches int `mapstructure:"max_concurrent_batches"`
 	// BroadcastWorkers sizes the persistent goroutine pool that runs every
-	// per-endpoint SubmitTransaction(s) HTTP call. Peak in-flight jobs is
+	// per-endpoint POST /txs HTTP call. Peak in-flight jobs is
 	// MaxConcurrentBatches × MaxParallelChunks × len(healthy endpoints).
 	// Under-sized workers serialize the pool and eat the parallelism gain
 	// from smaller chunks — at 8 concurrent batches × 4 chunks × 8 endpoints
@@ -574,23 +578,8 @@ type EventsConfig struct {
 // status-update bursts without committing significant memory upfront.
 const DefaultEventsSubscriberBuffer = 4096
 
-// TxValidatorConfig tunes the parallel batch validation pipeline. Parallelism
-// caps how many transactions are parsed and validated concurrently inside a
-// single flush window — bounded so a huge in-flight batch can't open more
-// goroutines than the host has cores. Zero or negative falls back to
-// runtime.NumCPU at construction time.
-type TxValidatorConfig struct {
-	Parallelism int `mapstructure:"parallelism"`
-	// MaxPending caps the in-memory pending-validation slice the validator
-	// consumer accumulates between flushes. Once full, new messages are
-	// returned as errors from handleMessage so the Kafka consumer's
-	// retry+DLQ path sheds load instead of growing the slice to OOM.
-	// Defaults to 50000.
-	MaxPending int `mapstructure:"max_pending"`
-}
-
 func BindFlags(cmd *cobra.Command) {
-	cmd.Flags().String("mode", "all", "Service mode: all, api-server, bump-builder, tx-validator, propagation, p2p-client")
+	cmd.Flags().String("mode", "all", "Service mode: all, api-server, bump-builder, propagation, p2p-client")
 	cmd.Flags().String("config", "", "Path to config file")
 	cmd.Flags().String("log-level", "info", "Log level: debug, info, warn, error")
 	_ = viper.BindPFlag("mode", cmd.Flags().Lookup("mode"))
@@ -860,11 +849,11 @@ func validate(cfg *Config) error {
 	validModes := map[string]bool{
 		"all": true, "api-server": true,
 		"bump-builder": true,
-		"tx-validator": true, "propagation": true,
-		"p2p-client":  true,
-		"chaintracks": true,
-		"sse":         true,
-		"watchdog":    true,
+		"propagation":  true,
+		"p2p-client":   true,
+		"chaintracks":  true,
+		"sse":          true,
+		"watchdog":     true,
 	}
 	if !validModes[cfg.Mode] {
 		return fmt.Errorf("invalid mode %q", cfg.Mode)

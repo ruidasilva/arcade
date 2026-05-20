@@ -45,3 +45,36 @@ func CheckPartitions(broker Broker, topics []string, minPartitions int, logger *
 	}
 	return nil
 }
+
+// CheckExactPartitions verifies that `topic` exists on the broker with
+// exactly `want` partitions. Returns an error on mismatch. Used for
+// topics where partition count is a correctness constraint (not a
+// scaling hint), e.g. the dep-aware dispatcher requires
+// TopicPropagation to be single-partition so its single-goroutine state
+// ownership covers the entire topic.
+//
+// Missing topics are treated as errors: for correctness-constrained
+// topics, allowing auto-creation on first publish could create the topic
+// with the broker default partition count instead of `want`.
+func CheckExactPartitions(broker Broker, topic string, want int, logger *zap.Logger) error {
+	count, err := broker.PartitionCount(topic)
+	if errors.Is(err, ErrTopicNotFound) {
+		return fmt.Errorf(
+			"topic %s not found on broker; create it before startup with exactly %d partitions (correctness requirement)",
+			topic,
+			want,
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("querying partition count for %s: %w", topic, err)
+	}
+	if count != want {
+		return fmt.Errorf("topic %s has %d partitions, want exactly %d (correctness requirement)", topic, count, want)
+	}
+	logger.Info(
+		"topic partition count matches required exact value",
+		zap.String("topic", topic),
+		zap.Int("partitions", count),
+	)
+	return nil
+}

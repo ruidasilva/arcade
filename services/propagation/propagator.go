@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,18 +25,16 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
-// reaperLeaseName is the well-known key every replica uses to coordinate
-// reaper ownership. A single lease per deployment — if you run separate
-// propagation deployments against the same store, give them distinct consumer
-// groups (which already differ by namespace) or override this constant.
-const reaperLeaseName = "propagation-reaper"
-
 type propagationMsg struct {
 	TXID string `json:"txid"`
 	// RawTx is the serialized transaction as raw bytes. encoding/json encodes
 	// []byte as base64 — still smaller than hex (4/3 expansion vs 2x) and
 	// avoids the per-hop hex encode/decode the pipeline used to do.
 	RawTx []byte `json:"raw_tx"`
+	// InputTXIDs lists the txids this tx spends from. Populated at intake
+	// so the propagator can decide eligibility without re-parsing the raw
+	// bytes. Empty means coinbase or no in-flight parents.
+	InputTXIDs []string `json:"input_txids,omitempty"`
 }
 
 type Propagator struct {
@@ -50,12 +48,20 @@ type Propagator struct {
 	merkleClient   *merkleservice.Client
 	consumer       *kafka.ConsumerGroup
 
-	mu                sync.Mutex
-	pendingMsgs       []propagationMsg
-	maxPending        int
+	maxPending int
+	// admitCh, requeueCh, terminalCh, and drainCh feed runDispatcher's
+	// single state-owning loop. The loop selects on these channels (and,
+	// in production, claim.Messages()) and runs ALL dep-aware state
+	// mutations — inFlight, waiters, heldMsgs, pendingMsgs, the
+	// offsetTracker, and the pendingMarks map — inside the goroutine
+	// that owns the loop. No locks, no atomics. See dispatcher.go.
+	admitCh           chan admitRequest
+	requeueCh         chan requeueRequest
+	terminalCh        chan terminalEvent
+	drainCh           chan drainRequest
+	dispatcherCancel  context.CancelFunc
+	dispatcherDone    chan struct{}
 	merkleConcurrency int
-	retryMaxAttempts  int
-	retryBackoffMs    int
 	reaperInterval    time.Duration
 	reaperBatchSize   int
 	teranodeBatchCap  int
@@ -64,12 +70,12 @@ type Propagator struct {
 	holderID          string
 	leaseTTL          time.Duration
 
-	// broadcastJobs feeds the persistent worker pool that runs all
-	// per-endpoint SubmitTransaction / SubmitTransactions calls. Replaces
-	// the previous per-broadcast `go func(ep)` spawn loop so sustained
-	// 50+ TPS doesn't produce constant goroutine churn — total broadcast
-	// goroutine count stays bounded at broadcastWorkers regardless of
-	// flush rate. Workers exit when broadcastJobs is closed in Stop().
+	// broadcastJobs feeds the persistent worker pool that runs every
+	// per-endpoint POST /txs call. Replaces the previous per-broadcast
+	// `go func(ep)` spawn loop so sustained 50+ TPS doesn't produce
+	// constant goroutine churn — total broadcast goroutine count stays
+	// bounded at broadcastWorkers regardless of flush rate. Workers
+	// exit when broadcastJobs is closed in Stop().
 	broadcastJobs    chan broadcastJob
 	broadcastWG      sync.WaitGroup
 	broadcastRunning atomic.Bool // true while Start() workers are running
@@ -88,12 +94,19 @@ type Propagator struct {
 	// worker pool so an in-flight batch doesn't lose its broadcast
 	// results to a closed jobs channel.
 	inflightBatches sync.WaitGroup
+	// backgroundWG tracks the long-running Start-spawned goroutines —
+	// runReaper, runMerkleReplay — so Stop can wait for them to exit
+	// before the surrounding app cleanup closes the store backing them.
+	// Without this, a reaper mid-lease-release or mid-status-scan
+	// races with store.Close and the test framework attributes the
+	// resulting goroutine panic to the test's Cleanup callback.
+	backgroundWG sync.WaitGroup
 }
 
 // broadcastJob is the unit of work the persistent broadcast pool consumes.
-// One job represents one HTTP call to one endpoint; the caller bundles a
-// per-call result channel so it can collect outcomes from multiple endpoints
-// in parallel without each worker carrying that bookkeeping.
+// One job represents one POST /txs call to one endpoint; the caller bundles
+// a per-call result channel so it can collect outcomes from multiple
+// endpoints in parallel without each worker carrying that bookkeeping.
 //
 // The ctx field is intentionally part of the value — the job travels through
 // a channel so the cancellation token has to ride with it. The standard
@@ -102,8 +115,6 @@ type Propagator struct {
 type broadcastJob struct {
 	ctx      context.Context //nolint:containedctx // travels with the work item through broadcastJobs channel
 	endpoint string
-	// Exactly one of rawTx (single /tx) or rawTxs (batch /txs) is set.
-	rawTx    []byte
 	rawTxs   [][]byte
 	resultCh chan<- broadcastJobResult
 }
@@ -111,8 +122,45 @@ type broadcastJob struct {
 type broadcastJobResult struct {
 	endpoint   string
 	statusCode int
-	err        error
+	// failures is the per-txid failure map extracted from a /txs HTTP 500
+	// "Failed to process transactions:" body (Teranode upstream main, post
+	// #879). Each entry is keyed by the txid embedded in
+	// "[ProcessTransaction][<txid>]" and the value is the full error line
+	// verbatim (e.g. "TX_INVALID (31): [ProcessTransaction][<txid>] tx is
+	// invalid because..."). Absent here means accepted (after a peer 500).
+	// nil for 200, transport errors, and any 5xx that doesn't match the
+	// Teranode failure-list shape — those cases drive the whole-batch
+	// requeue path.
+	failures map[string]string
+	err      error
 }
+
+// txResultClass categorizes a per-tx broadcast outcome into the action
+// the caller should take. The dep-aware pipeline collapses Teranode's
+// rich error vocabulary into three buckets.
+type txResultClass int
+
+const (
+	// txResultClassUnknown is the zero value — a result that hasn't been
+	// classified yet. Should never reach the caller; if it does,
+	// processBatch's default branch treats it the same as Requeue.
+	txResultClassUnknown txResultClass = iota
+	// txResultClassAccepted: terminalize as ACCEPTED_BY_NETWORK, dispatcher
+	// releases waiters.
+	txResultClassAccepted
+	// txResultClassRejected: terminalize as REJECTED, dispatcher cascade-
+	// rejects descendants. errMsg carries the Teranode code (e.g.
+	// "TX_INVALID (31)") so it shows up in the wallet-visible row.
+	txResultClassRejected
+	// txResultClassRequeue: broadcast didn't produce a verdict for this
+	// tx (no peer reachable, /txs returned 4xx/5xx with no per-slot body,
+	// per-slot PROCESSING / infra-bucket code). processBatch routes the
+	// tx through requeueAfterDelay → dispatcher.requeueCh after a flat
+	// wait, which re-runs admission so the tx gets another flush. The
+	// row stays at RECEIVED in the DB; the dispatcher inFlight entry and
+	// pinned Kafka offset both persist across the requeue.
+	txResultClassRequeue
+)
 
 // broadcastJobBuffer sizes the job channel between broadcast helpers and the
 // worker pool. Generous enough that flush-time fan-out doesn't block in
@@ -140,14 +188,8 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	if merkleConcurrency <= 0 {
 		merkleConcurrency = 10
 	}
-	retryMax := cfg.Propagation.RetryMaxAttempts
-	if retryMax <= 0 {
-		retryMax = 5
-	}
-	retryBackoff := cfg.Propagation.RetryBackoffMs
-	if retryBackoff <= 0 {
-		retryBackoff = 500
-	}
+	// Reaper config drives the periodic SEEN_ON_NETWORK rebroadcast scan
+	// and the lease that coordinates it across replicas.
 	reaperInterval := time.Duration(cfg.Propagation.ReaperIntervalMs) * time.Millisecond
 	if reaperInterval <= 0 {
 		reaperInterval = 30 * time.Second
@@ -158,9 +200,6 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	}
 	leaseTTL := time.Duration(cfg.Propagation.LeaseTTLMs) * time.Millisecond
 	if leaseTTL <= 0 {
-		// Default to 3× the tick interval so a slow or delayed tick doesn't
-		// trigger a false-positive failover. This is the standard safety
-		// factor for heartbeat-style leases.
 		leaseTTL = 3 * reaperInterval
 	}
 	teranodeBatchCap := cfg.Propagation.TeranodeMaxBatchSize
@@ -183,7 +222,7 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 	if maxParallelChunks <= 0 {
 		maxParallelChunks = defaultMaxParallelChunks
 	}
-	return &Propagator{
+	p := &Propagator{
 		cfg:               cfg,
 		logger:            logger.Named("propagation"),
 		producer:          producer,
@@ -194,8 +233,6 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		merkleClient:      mc,
 		maxPending:        maxPending,
 		merkleConcurrency: merkleConcurrency,
-		retryMaxAttempts:  retryMax,
-		retryBackoffMs:    retryBackoff,
 		reaperInterval:    reaperInterval,
 		reaperBatchSize:   reaperBatch,
 		teranodeBatchCap:  teranodeBatchCap,
@@ -205,29 +242,45 @@ func New(cfg *config.Config, logger *zap.Logger, producer *kafka.Producer, publi
 		leaseTTL:          leaseTTL,
 		broadcastJobs:     make(chan broadcastJob, broadcastJobBuffer),
 		processBatchSem:   make(chan struct{}, maxConcurrentBatches),
+		admitCh:           make(chan admitRequest, dispatcherChannelBuffer),
+		requeueCh:         make(chan requeueRequest, dispatcherChannelBuffer),
+		terminalCh:        make(chan terminalEvent, dispatcherChannelBuffer),
+		drainCh:           make(chan drainRequest),
 	}
+	// Start a dispatcher goroutine with a nil claim so tests that
+	// construct via New and drive via admitCh / drainCh have a running
+	// state machine without needing to invoke Start. In production
+	// Start replaces this with the same loop running inside the kafka
+	// ClaimHandler — see Start. The two paths can't both be live at
+	// once: Start cancels this context AND waits on dispatcherDone
+	// before subscribing, guaranteeing the test-mode goroutine has
+	// fully exited before any production dispatcher loop runs.
+	dispatcherCtx, dispatcherCancel := context.WithCancel(context.Background())
+	p.dispatcherCancel = dispatcherCancel
+	p.dispatcherDone = make(chan struct{})
+	go func() {
+		defer close(p.dispatcherDone)
+		if err := p.runDispatcher(dispatcherCtx, nil, dispatcherConfig{maxPending: maxPending}); err != nil {
+			p.logger.Error("test-mode dispatcher exited with error", zap.Error(err))
+		}
+	}()
+	return p
 }
 
-// runBroadcastWorker pulls jobs off broadcastJobs and runs the HTTP submit
-// against the named endpoint. Exits when broadcastJobs is closed (Stop()).
-// The job's context governs cancellation — a winning sibling cancels the
-// per-call broadcastCtx and a 15s deadline bounds worst-case wall time.
+// runBroadcastWorker pulls jobs off broadcastJobs and runs POST /txs against
+// the named endpoint. Exits when broadcastJobs is closed (Stop()). The job's
+// context governs cancellation — a winning sibling cancels the per-call
+// broadcastCtx and a 15s deadline bounds worst-case wall time.
 func (p *Propagator) runBroadcastWorker() {
 	defer p.broadcastWG.Done()
 	for job := range p.broadcastJobs {
-		var statusCode int
-		var err error
-		if job.rawTxs != nil {
-			statusCode, err = p.teranodeClient.SubmitTransactions(job.ctx, job.endpoint, job.rawTxs)
-		} else {
-			statusCode, err = p.teranodeClient.SubmitTransaction(job.ctx, job.endpoint, job.rawTx)
-		}
+		statusCode, failures, err := p.teranodeClient.SubmitTransactions(job.ctx, job.endpoint, job.rawTxs)
 		// Non-blocking send — the caller always allocates resultCh with
 		// capacity ≥ number of jobs it submits, so this never blocks. Using
 		// non-blocking lets a Stop() racing with in-flight broadcasts not
 		// deadlock the worker on an abandoned channel.
 		select {
-		case job.resultCh <- broadcastJobResult{endpoint: job.endpoint, statusCode: statusCode, err: err}:
+		case job.resultCh <- broadcastJobResult{endpoint: job.endpoint, statusCode: statusCode, failures: failures, err: err}:
 		default:
 		}
 	}
@@ -311,6 +364,56 @@ func (p *Propagator) applyTerminalStatuses(ctx context.Context, terminalStatuses
 
 	p.publishBulkStatus(ctx, models.StatusAcceptedByNetwork, acceptedTxIDs, now)
 	p.publishBulkStatus(ctx, models.StatusRejected, rejectedTxIDs, now)
+
+	// Notify the dispatcher of every terminal status flip. ACCEPTED
+	// releases waiters via the dispatcher itself (no caller action
+	// needed — released msgs are appended directly to the
+	// dispatcher's pendingMsgs). REJECTED returns cascaded
+	// descendants we write REJECTED rows for; the cascade reason is
+	// always "parent rejected" regardless of the parent's actual
+	// cause — see persistCascadeRejections.
+	var allCascaded []string
+	for _, txid := range acceptedTxIDs {
+		p.notifyTerminalToDispatcher(txid, models.StatusAcceptedByNetwork)
+	}
+	for _, txid := range rejectedTxIDs {
+		r := p.notifyTerminalToDispatcher(txid, models.StatusRejected)
+		allCascaded = append(allCascaded, r.cascaded...)
+	}
+	if len(allCascaded) > 0 {
+		p.persistCascadeRejections(ctx, allCascaded, now)
+	}
+}
+
+// persistCascadeRejections writes terminal REJECTED rows for txs the
+// dep cascade rejected without ever broadcasting them, then emits one
+// bulk publish so SSE/webhook subscribers learn about the outcome.
+// Best-effort: a store write failure is logged but doesn't undo the
+// in-memory cascade state (the dispatcher has already terminalized
+// them; we'd be reconciling at restart via Kafka replay anyway).
+func (p *Propagator) persistCascadeRejections(ctx context.Context, txids []string, now time.Time) {
+	statuses := make([]*models.TransactionStatus, len(txids))
+	for i, txid := range txids {
+		statuses[i] = &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusRejected,
+			Timestamp: now,
+			// "parent rejected" is the only structural reason that
+			// applies to a cascaded child — it didn't fail for any
+			// reason of its own. The parent's actual cause lives on
+			// the parent's row; downstream consumers can correlate
+			// via the dep graph if they care.
+			ExtraInfo: "parent rejected",
+		}
+	}
+	if _, err := p.store.BatchUpdateStatusReturning(ctx, statuses); err != nil {
+		p.logger.Warn(
+			"cascade rejection write failed",
+			zap.Int("count", len(txids)),
+			zap.Error(err),
+		)
+	}
+	p.publishBulkStatus(ctx, models.StatusRejected, txids, now)
 }
 
 // publishBulkStatus fans a post-broadcast batch status update onto the
@@ -338,15 +441,31 @@ func (p *Propagator) publishBulkStatus(ctx context.Context, status models.Status
 }
 
 func (p *Propagator) Start(ctx context.Context) error {
+	// Stop the test-mode dispatcher goroutine started in New(); the
+	// production lifecycle runs the same loop inside the kafka
+	// ClaimHandler so dep state + offset marking stay on a single
+	// goroutine. Wait for dispatcherDone before subscribing — cancel()
+	// returns immediately, and the loop may still be parked on a
+	// channel read when it does. Any future caller that pushes to
+	// admitCh / requeueCh / terminalCh / drainCh during Start would
+	// otherwise race the old goroutine.
+	if p.dispatcherCancel != nil {
+		p.dispatcherCancel()
+		p.dispatcherCancel = nil
+		if p.dispatcherDone != nil {
+			<-p.dispatcherDone
+			p.dispatcherDone = nil
+		}
+	}
+
 	consumer, err := kafka.NewConsumerGroup(kafka.ConsumerConfig{
-		Broker:     p.producer.Broker(),
-		GroupID:    p.cfg.Kafka.ConsumerGroup + "-propagation",
-		Topics:     []string{kafka.TopicPropagation},
-		Handler:    p.handleMessage,
-		FlushFunc:  p.flushBatch,
-		Producer:   p.producer,
-		MaxRetries: p.cfg.Kafka.MaxRetries,
-		Logger:     p.logger,
+		Broker:       p.producer.Broker(),
+		GroupID:      p.cfg.Kafka.ConsumerGroup + "-propagation",
+		Topics:       []string{kafka.TopicPropagation},
+		Producer:     p.producer,
+		MaxRetries:   p.cfg.Kafka.MaxRetries,
+		Logger:       p.logger,
+		ClaimHandler: p.handleClaim(ctx),
 	})
 	if err != nil {
 		return fmt.Errorf("creating consumer group: %w", err)
@@ -364,25 +483,57 @@ func (p *Propagator) Start(ctx context.Context) error {
 		go p.runBroadcastWorker()
 	}
 
-	// Kick off the durable-retry reaper alongside the Kafka consumer. It owns
-	// all rebroadcast work for PENDING_RETRY rows, decoupled from the incoming
-	// message flush cycle so a retry storm can't starve live traffic.
-	go p.runReaper(ctx)
-
 	// Replay in-flight registrations to merkle-service. One-shot; exits on
 	// its own. Compensates for /watch state loss on the merkle-service side
 	// (recreated namespace, data wipe, schema migration) which otherwise
 	// silently disables STUMP callbacks for every previously-submitted tx.
-	go p.runMerkleReplay(ctx)
+	p.backgroundWG.Add(1)
+	go func() {
+		defer p.backgroundWG.Done()
+		p.runMerkleReplay(ctx)
+	}()
+
+	// Reaper: scans the status store for non-terminal rows that have
+	// been stuck longer than the per-status thresholds and rebroadcasts
+	// them. The reaper is the durable retry surface — processBatch
+	// itself runs each tx through the broadcast pipeline exactly once
+	// and relies on the reaper to retry anything that didn't reach a
+	// terminal verdict.
+	p.backgroundWG.Add(1)
+	go func() {
+		defer p.backgroundWG.Done()
+		p.runReaper(ctx)
+	}()
 
 	p.logger.Info(
 		"propagation service started",
 		zap.Duration("reaper_interval", p.reaperInterval),
-		zap.Int("reaper_batch_size", p.reaperBatchSize),
 		zap.Int("broadcast_workers", p.broadcastWorkers),
 		zap.Int("max_parallel_chunks", p.maxParallelChunks),
 	)
 	return consumer.Run(ctx)
+}
+
+// handleClaim returns the kafka.ClaimHandler that owns each per-partition
+// session. The dispatcher loop runs in the goroutine Sarama hands us via
+// claim, so dep state, Kafka offset tracking, and claim.MarkMessage all
+// happen on the same goroutine.
+func (p *Propagator) handleClaim(ctx context.Context) kafka.ClaimHandler {
+	cfg := dispatcherConfig{maxPending: p.maxPending}
+	return func(claim kafka.Claim) error {
+		// Use the claim's context as a child of the service context so
+		// shutdown OR a rebalance both unblock the loop.
+		claimCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go func() {
+			select {
+			case <-claim.Context().Done():
+				cancel()
+			case <-claimCtx.Done():
+			}
+		}()
+		return p.runDispatcher(claimCtx, claim, cfg)
+	}
 }
 
 // WaitForBatches blocks until every processBatch goroutine spawned by
@@ -412,19 +563,36 @@ func (p *Propagator) Stop() error {
 		close(p.broadcastJobs)
 		p.broadcastWG.Wait()
 	}
+	// Cancel the test-mode dispatcher goroutine started in New (if
+	// Start was never called and so didn't already drain it). Wait on
+	// dispatcherDone so the goroutine has fully exited before Stop
+	// returns — otherwise it may still be holding references to the
+	// store the surrounding test cleanup is about to close.
+	if p.dispatcherCancel != nil {
+		p.dispatcherCancel()
+		if p.dispatcherDone != nil {
+			<-p.dispatcherDone
+		}
+	}
+	// Wait for the long-running Start-spawned goroutines (reaper,
+	// merkle replay) to exit before returning. The surrounding app
+	// cleanup will close the store as soon as Stop returns; if the
+	// reaper is mid-IterateStatusesSince or mid-lease-release on a
+	// closed store, the goroutine panics and the test framework
+	// attributes the failure to t.Cleanup. Their parent ctx has
+	// already been canceled by the caller, so this only blocks on
+	// in-flight scan/release work.
+	p.backgroundWG.Wait()
 	return consumerErr
 }
 
 // handleMessage decodes the propagation envelope and queues it for the next
-// flushBatch. Cheap on purpose: no HTTP, no DB. The Kafka consumer's drain
-// loop can race through messages at memory-broker speed, and the batched
-// register-then-broadcast happens in flushBatch.
+// flushBatch. Cheap on purpose: no HTTP, no DB.
 //
-// F-024 durability is preserved at the batch level: flushBatch runs
+// F-024 durability is preserved at the batch level: processBatch runs
 // RegisterBatchWithResults before broadcasting, and any tx whose registration
-// failed is routed to handleRetryableFailure (durable PENDING_RETRY) and
-// excluded from broadcast. The retry+DLQ semantics that used to live here per
-// message are now reaper-driven.
+// failed is excluded from the broadcast and left at RECEIVED for the reaper
+// to retry on its next tick.
 //
 // A high-water-mark on pendingMsgs guards against unbounded growth if a
 // downstream stall lasts longer than the consumer's offset commit window.
@@ -438,21 +606,15 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 		return fmt.Errorf("propagation message has empty raw_tx")
 	}
 
-	p.mu.Lock()
-	if p.maxPending > 0 && len(p.pendingMsgs) >= p.maxPending {
-		depth := len(p.pendingMsgs)
-		p.mu.Unlock()
-		metrics.PropagationPendingDepth.Set(float64(depth))
-		// Returning an error here surfaces back to the consumer's retry+DLQ
-		// path. That's the desired behavior under sustained backpressure —
-		// shedding into DLQ is preferable to ballooning memory until OOM.
-		return fmt.Errorf("propagation pending queue full (depth=%d, max=%d)", depth, p.maxPending)
-	}
-	p.pendingMsgs = append(p.pendingMsgs, propMsg)
-	depth := len(p.pendingMsgs)
-	p.mu.Unlock()
-	metrics.PropagationPendingDepth.Set(float64(depth))
-
+	// All admission logic — parent dep check, pendingMsgs append,
+	// offset tracker bookkeeping — happens on the dispatcher
+	// goroutine. When pending is at its cap, the dispatcher's select
+	// excludes admitCh, so this send blocks. The Kafka consumer
+	// goroutine waits here until the dispatcher has room, which
+	// naturally pauses Kafka pulls and lets backpressure flow back to
+	// the broker. No DLQ, no error to the client; the only observable
+	// effect is briefly increased consumer lag.
+	_ = p.admitToDispatcher(propMsg, msg.Offset)
 	return nil
 }
 
@@ -482,10 +644,10 @@ func (p *Propagator) handleMessage(_ context.Context, msg *kafka.Message) error 
 // ACCEPTED_BY_NETWORK can't regress a tx that a faster sibling already moved
 // to SEEN_ON_NETWORK.
 func (p *Propagator) flushBatch(ctx context.Context) error {
-	p.mu.Lock()
-	batch := p.pendingMsgs
-	p.pendingMsgs = nil
-	p.mu.Unlock()
+	// Drain pendingMsgs from the dispatcher goroutine via the
+	// drainCh request/reply. The dispatcher owns the slice; we
+	// receive a snapshot and own it from here on.
+	batch := p.drainPending()
 	metrics.PropagationPendingDepth.Set(0)
 
 	if len(batch) == 0 {
@@ -511,15 +673,17 @@ func (p *Propagator) flushBatch(ctx context.Context) error {
 }
 
 // registerBatch invokes merkle-service /watch for every tx in the batch and
-// partitions the result into "registered" (broadcast-eligible) and "failed"
-// (routed to handleRetryableFailure). Preserves F-024: every tx that
-// downstream broadcasts is provably registered.
+// returns the subset that registered successfully. Txs whose /watch failed
+// returns the successfully-registered subset for broadcast and the failed
+// subset for caller-driven requeue. Per-tx errors: failures (network
+// blip on one /watch call, etc.) go to the failed slice so processBatch
+// can requeue them through the dispatcher after a short flat wait.
 //
 // When the merkle integration is disabled (client nil or no callback URL),
-// every tx is treated as registered — there's no registration step to fail.
-func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) (registered []propagationMsg) {
+// every tx is treated as registered.
+func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) (registered, failed []propagationMsg) {
 	if p.merkleClient == nil || p.cfg.CallbackURL == "" {
-		return batch
+		return batch, nil
 	}
 
 	regs := make([]merkleservice.Registration, len(batch))
@@ -536,44 +700,43 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 	metrics.PropagationMerkleRegisterDuration.Observe(time.Since(start).Seconds())
 
 	registered = make([]propagationMsg, 0, len(batch))
+	failed = make([]propagationMsg, 0)
 	successTxIDs := make([]string, 0, len(batch))
-	var failedCount int
+	var sampleErr error
 	for i, err := range errs {
 		if err == nil {
 			registered = append(registered, batch[i])
 			successTxIDs = append(successTxIDs, batch[i].TXID)
 			continue
 		}
-		failedCount++
+		failed = append(failed, batch[i])
+		if sampleErr == nil {
+			sampleErr = err
+		}
 		metrics.PropagationMerkleRegisterFailures.WithLabelValues("register_error").Inc()
-		// Mirror the prior per-message contract: a failed register must not
-		// broadcast and must not be lost. Route to durable PENDING_RETRY so
-		// the reaper re-attempts registration+broadcast on its own cadence.
-		p.handleRetryableFailure(ctx, batch[i].TXID, batch[i].RawTx)
 	}
-	if failedCount > 0 {
-		p.logger.Warn(
-			"merkle-service registration partial failure",
-			zap.Int("batch_size", len(batch)),
-			zap.Int("failed", failedCount),
-			zap.Int("registered", len(registered)),
-		)
-	}
+
 	switch {
-	case failedCount == 0:
+	case len(failed) == 0:
 		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("fully_ok").Inc()
 	case len(registered) == 0:
 		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("all_failed").Inc()
 	default:
 		metrics.PropagationMerkleRegisterBatchOutcomeTotal.WithLabelValues("partial").Inc()
 	}
-	// Stamp merkle_registered_at on every tx we successfully registered. The
-	// startup replay loop reads this and skips rows registered within
-	// MerkleReplaySkipRecentMinutes — without it, every restart re-walks the
-	// whole watchlist regardless of whether merkle-service already has it
-	// (issue #145). A failure here must not block broadcast: the mark is a
-	// hint, not part of the F-024 invariant. Worst case a missed mark causes
-	// one redundant /watch on the next replay.
+	if len(failed) > 0 {
+		p.logger.Warn(
+			"merkle-service /watch partial/all failure; requeueing failed subset",
+			zap.Int("batch_size", len(batch)),
+			zap.Int("failed", len(failed)),
+			zap.Int("registered", len(registered)),
+			zap.Error(sampleErr),
+		)
+	}
+
+	// Stamp merkle_registered_at on the successful subset so the startup
+	// replay loop can skip them. A store-write failure here must not block
+	// broadcast — the mark is a hint, not part of the F-024 invariant.
 	if len(successTxIDs) > 0 {
 		if err := p.store.MarkMerkleRegisteredByTxIDs(ctx, successTxIDs, time.Now()); err != nil {
 			p.logger.Warn(
@@ -583,48 +746,96 @@ func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) 
 			)
 		}
 	}
-	return registered
+	return registered, failed
 }
 
-// txResult carries per-tx outcome of a broadcast, used by both the initial
-// processBatch path and the reaper. successEndpoint is the URL of the peer
-// whose response drove the accepted status (empty when no peer accepted or
-// the broadcast produced no verdict), useful for operator-visible logs.
+// txResult carries per-tx outcome of a broadcast. class is the
+// authoritative bucket (accepted / rejected / requeue) that processBatch
+// switches on; the other fields are diagnostic / status-write inputs.
+//
+// successEndpoint is the URL of the peer whose response drove the
+// accepted status (empty when no peer accepted or the broadcast
+// produced no verdict). errMsg carries a short Teranode code string
+// like "TX_INVALID (31)" when the class is rejected.
 type txResult struct {
+	class           txResultClass
 	status          *models.TransactionStatus
 	errMsg          string
 	rawTx           []byte
 	successEndpoint string
-	// acknowledged mirrors broadcastResult.Acknowledged: a peer responded
-	// with 2xx but no definitive verdict (typically all 202s). Lets
-	// processBatch tell apart "tx is in flight" (don't retry) from "no
-	// peer was reachable" (retry durably).
-	acknowledged bool
 }
 
-// processBatch handles a batch of propagation messages:
-//  1. Register every tx with merkle-service (batched, bounded concurrency).
-//     Failed-register txs go to handleRetryableFailure and are EXCLUDED from
-//     the broadcast pass — preserves the F-024 "register before broadcast"
-//     invariant at batch granularity.
-//  2. Broadcast registered txs to teranode endpoints, chunked to
-//     teranodeBatchCap.
-//  3. Update status for each transaction.
+// classifyFailureLine maps one Teranode /txs failure line into a dispatcher
+// action bucket. The line is the full UserMessage produced by Teranode,
+// e.g. "TX_INVALID (31): [ProcessTransaction][<txid>] ...". A line in the
+// terminal-rejection bucket (TX_INVALID, UTXO_SPENT, etc.) → rejected.
+// Anything else (PROCESSING wrapper, unrecognized code, malformed line) →
+// requeue so the next attempt has a chance to produce a verdict. errMsg is
+// the line verbatim so wallet rows surface the actual Teranode code.
+func classifyFailureLine(line string) (txResultClass, string) {
+	if isTeranodeTerminalCode(line) {
+		return txResultClassRejected, line
+	}
+	return txResultClassRequeue, line
+}
+
+// teranodeTerminalCodes is the set of upstream Teranode error code names
+// that classify a tx as terminally rejected. PROCESSING and anything else
+// falls through to requeue (infra-bucket failure that should be retried).
+var teranodeTerminalCodes = map[string]struct{}{
+	"TX_INVALID":              {},
+	"TX_INVALID_DOUBLE_SPEND": {},
+	"TX_CONFLICTING":          {},
+	"TX_LOCKED":               {},
+	"TX_LOCK_TIME":            {},
+	"TX_POLICY":               {},
+	"TX_COINBASE_IMMATURE":    {},
+	"TX_MISSING_PARENT":       {},
+	"UTXO_FROZEN":             {},
+	"UTXO_SPENT":              {},
+	"UTXO_NON_FINAL":          {},
+	"UTXO_INVALID_SIZE":       {},
+	"INVALID_ARGUMENT":        {},
+}
+
+// isTeranodeTerminalCode reports whether a failure line names a Teranode
+// code in the terminal-rejection bucket. Matches the leading NAME of
+// "NAME (num): <message>" (the first whitespace-delimited token).
+// Anything else (PROCESSING wrapper, network-only codes, unrecognized
+// strings) is treated as infra → requeue.
+func isTeranodeTerminalCode(line string) bool {
+	name := line
+	if idx := strings.IndexByte(name, ' '); idx >= 0 {
+		name = name[:idx]
+	}
+	_, ok := teranodeTerminalCodes[name]
+	return ok
+}
+
+// processBatch handles one drained batch:
+//  1. Register every tx with merkle-service. Txs whose /watch failed are
+//     requeued through the dispatcher after a short flat wait.
+//  2. Broadcast the registered subset to teranode in /txs chunks.
+//  3. For each per-tx result, apply the corresponding action:
+//     - Accepted → terminal ACCEPTED row + dispatcher notify (releases waiters)
+//     - Rejected → terminal REJECTED row + dispatcher notify (cascade)
+//     - Requeue  → requeue through the dispatcher after a short flat wait
+//     (transient infra failure: peer 5xx with no per-slot info, no peer
+//     reachable, per-slot infra code). The Kafka offset stays pinned via
+//     the existing inFlight entry.
 //
-// All failure paths are absorbed internally: per-tx failures route to
-// PENDING_RETRY or get logged-and-skipped, and a batch-wide store error is
-// logged on the goroutine spawned by flushBatch. There is no caller that
-// reacts to an aggregate error here, so the function returns void.
+// Failure paths are absorbed internally — there's no caller that reacts
+// to an aggregate error here, so the function returns void.
 func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
-	// Step 1: register all txs with merkle-service in parallel. Drops any tx
-	// whose registration failed — that tx is already queued for durable retry
-	// via handleRetryableFailure inside registerBatch.
-	batch = p.registerBatch(ctx, batch)
-	if len(batch) == 0 {
+	registered, failedRegister := p.registerBatch(ctx, batch)
+	if len(failedRegister) > 0 {
+		p.requeueAfterDelay(ctx, failedRegister)
+	}
+	if len(registered) == 0 {
 		return
 	}
+	batch = registered
 
-	// Log batch summary for traceability
 	txidSample := make([]string, 0, 5)
 	for i, msg := range batch {
 		if i >= 5 {
@@ -640,23 +851,17 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 
 	metrics.PropagationBatchSize.Observe(float64(len(batch)))
 
-	// Step 2: Broadcast in chunks bounded by teranodeBatchCap so a single
-	// oversized Kafka flush doesn't blow past Teranode's /txs size limit.
 	rawTxs := make([][]byte, len(batch))
 	for i, msg := range batch {
 		rawTxs[i] = msg.RawTx
 	}
 	results := p.broadcastInChunks(ctx, batch, rawTxs)
 
-	// Step 2: Classify per-tx outcomes and bundle terminal-status updates
-	// into one BatchUpdateStatusReturning + one PublishBulk per terminal
-	// status. This drops the propagator's per-tx Kafka send count from N
-	// to ≤2 per flush (one event for accepted, one for rejected), mirroring
-	// the callback-handler optimization already shipped for SEEN_ON_NETWORK.
 	seenEndpoints := make(map[string]struct{})
 	var successEndpoints []string
-	var accepted, rejected, retryable, noVerdict int
+	var accepted, rejected int
 	terminalStatuses := make([]*models.TransactionStatus, 0, len(results))
+	var toRequeue []propagationMsg
 	for i, res := range results {
 		if res.successEndpoint != "" {
 			if _, ok := seenEndpoints[res.successEndpoint]; !ok {
@@ -664,70 +869,91 @@ func (p *Propagator) processBatch(ctx context.Context, batch []propagationMsg) {
 				successEndpoints = append(successEndpoints, res.successEndpoint)
 			}
 		}
-		if res.status == nil {
-			noVerdict++
-			// Two sub-cases:
-			//   - acknowledged: at least one peer responded 2xx (typically
-			//     202 — accepted, will report back). Tx is in flight — don't
-			//     queue a retry, the merkle-service callback / next broadcast
-			//     will move it forward.
-			//   - !acknowledged: no peer was reachable at all (every endpoint
-			//     sidelined, or every responder canceled-by-broadcast). The
-			//     tx is stuck in RECEIVED unless we route to PENDING_RETRY so
-			//     the reaper picks it up on its next tick. This is the fix
-			//     for the 02:07 EDT incident where ~1.6M txs sat in RECEIVED
-			//     forever while the breaker had sidelined every endpoint.
-			if !res.acknowledged {
-				p.handleRetryableFailure(ctx, batch[i].TXID, res.rawTx)
-			}
-			continue
-		}
-		if res.status.Status == models.StatusRejected && IsRetryableError(res.errMsg) {
-			retryable++
-			p.handleRetryableFailure(ctx, batch[i].TXID, res.rawTx)
-			continue
-		}
-		switch res.status.Status {
-		case models.StatusAcceptedByNetwork:
+		switch res.class {
+		case txResultClassAccepted:
 			accepted++
-		case models.StatusRejected:
+			if res.status != nil {
+				terminalStatuses = append(terminalStatuses, res.status)
+			}
+		case txResultClassRejected:
 			rejected++
+			if res.status != nil {
+				terminalStatuses = append(terminalStatuses, res.status)
+			}
 		default:
-			// Other statuses (Mined, SeenOnNetwork, etc.) flow through
-			// without affecting the accepted/rejected counters.
+			// Requeue / Unknown: transient infra failure. Collect for
+			// requeue after a short flat wait so the dispatcher re-runs
+			// admission (dep-aware) and the tx flows through the next
+			// flush.
+			toRequeue = append(toRequeue, batch[i])
 		}
-		terminalStatuses = append(terminalStatuses, res.status)
 	}
 
 	p.applyTerminalStatuses(ctx, terminalStatuses, accepted, rejected)
+	if len(toRequeue) > 0 {
+		p.requeueAfterDelay(ctx, toRequeue)
+	}
 	metrics.PropagationOutcomeTotal.WithLabelValues("accepted").Add(float64(accepted))
 	metrics.PropagationOutcomeTotal.WithLabelValues("rejected").Add(float64(rejected))
-	metrics.PropagationOutcomeTotal.WithLabelValues("retryable").Add(float64(retryable))
-	metrics.PropagationOutcomeTotal.WithLabelValues("no_verdict").Add(float64(noVerdict))
+	metrics.PropagationOutcomeTotal.WithLabelValues("skipped").Add(float64(len(toRequeue)))
 
 	p.logger.Info(
 		"batch propagated",
 		zap.Int("count", len(batch)),
+		zap.Int("accepted", accepted),
+		zap.Int("rejected", rejected),
+		zap.Int("requeued", len(toRequeue)),
 		zap.Strings("success_endpoints", successEndpoints),
 	)
+}
+
+// requeueDelay is the flat wait before a requeue lands back on the
+// dispatcher. Long enough to ride out a brief upstream blip; short
+// enough that submitter-visible latency stays acceptable. Tunable if
+// observed retry traffic suggests a different cadence works better.
+const requeueDelay = 2 * time.Second
+
+// requeueAfterDelay schedules a delayed requeue of msgs through the
+// dispatcher. Spawns a goroutine that sleeps requeueDelay then sends
+// each msg to requeueCh. The goroutine bails on ctx cancellation so
+// claim revocation and shutdown don't hold txs in limbo.
+func (p *Propagator) requeueAfterDelay(ctx context.Context, msgs []propagationMsg) {
+	if len(msgs) == 0 {
+		return
+	}
+	// Track pending requeue goroutines on the metric so sustained
+	// upstream pressure shows up in dashboards without needing to
+	// introspect goroutines. Per-call goroutine + timer is intentional
+	// (see the requeueDelay comment) — the gauge is the observability
+	// hook for catching the failure mode where TPS × requeueDelay
+	// fans out further than capacity tolerates.
+	metrics.PropagationPendingRequeues.Inc()
+	go func(msgs []propagationMsg) {
+		defer metrics.PropagationPendingRequeues.Dec()
+		select {
+		case <-time.After(requeueDelay):
+		case <-ctx.Done():
+			return
+		}
+		for _, m := range msgs {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			p.requeueToDispatcher(m)
+		}
+	}(msgs)
 }
 
 // Per-batch chunk parallelism is now config-driven via
 // cfg.Propagation.MaxParallelChunks (see Propagator.maxParallelChunks);
 // defaults to defaultMaxParallelChunks.
 
-// fallbackParallelism caps concurrent per-tx broadcasts when an all-rejected
-// chunk falls back to per-tx classification. Each single-tx broadcast already
-// fans out across endpoints, so the effective in-flight count per chunk is
-// fallbackParallelism × len(endpoints). Sized to keep a single failing chunk
-// from monopolising the HTTP client's connection pool.
-const fallbackParallelism = 8
-
 // broadcastInChunks splits a batch into teranodeBatchCap-sized chunks and
-// broadcasts each via /txs, falling back to per-tx /tx within a chunk only
-// when that chunk's batch broadcast is all-rejected. Chunks run in parallel
-// bounded by p.maxParallelChunks so a large flush doesn't serialize behind
-// one slow endpoint. Returns per-tx results in the same order as the input.
+// broadcasts each via /txs. Chunks run in parallel bounded by
+// p.maxParallelChunks so a large flush doesn't serialize behind one slow
+// endpoint. Returns per-tx results in the same order as the input.
 func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationMsg, rawTxs [][]byte) []txResult {
 	results := make([]txResult, len(batch))
 	chunkSize := p.teranodeBatchCap
@@ -770,226 +996,14 @@ func (p *Propagator) broadcastInChunks(ctx context.Context, batch []propagationM
 	return results
 }
 
-// broadcastChunk broadcasts a single chunk (≤ teranodeBatchCap). Single-tx
-// chunks go to /tx; multi-tx chunks try /txs first and fall back to per-tx
-// only on all-rejected. The per-tx fallback is logged as a single summary
-// line to avoid flooding the log with one entry per transaction.
+// broadcastChunk broadcasts a single chunk (≤ teranodeBatchCap) via POST
+// /txs and writes per-tx classifications into out. /txs handles any chunk
+// size — a chunk of one is just one tx's bytes — so there's a single
+// classification path regardless of count.
 func (p *Propagator) broadcastChunk(ctx context.Context, chunk []propagationMsg, rawTxs [][]byte, out []txResult) {
-	if len(chunk) == 1 {
-		metrics.PropagationChunkTotal.WithLabelValues("none").Inc()
-		br := p.broadcastSingleToEndpoints(ctx, rawTxs[0], chunk[0].TXID)
-		out[0] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTx: chunk[0].RawTx, successEndpoint: br.SuccessEndpoint, acknowledged: br.Acknowledged}
-		return
-	}
-
-	batchStatuses, batchSuccessEndpoint := p.broadcastBatchToEndpoints(ctx, rawTxs, chunk)
-	allRejected := len(batchStatuses) > 0
-	for _, s := range batchStatuses {
-		if s != nil && s.Status != models.StatusRejected {
-			allRejected = false
-			break
-		}
-	}
-	if !allRejected {
-		metrics.PropagationChunkTotal.WithLabelValues("none").Inc()
-		for i, s := range batchStatuses {
-			out[i] = txResult{status: s, rawTx: chunk[i].RawTx, successEndpoint: batchSuccessEndpoint}
-		}
-		return
-	}
-	metrics.PropagationChunkTotal.WithLabelValues("per_tx_after_all_rejected").Inc()
-
-	// Fallback: per-tx classification for this chunk only. Summarize instead
-	// of logging per call — one line per fallback, not N.
-	//
-	// Cap concurrency so a 100-tx chunk in all-rejected state doesn't spawn
-	// 100 goroutines × N endpoints of in-flight HTTP requests at once. Each
-	// single-tx broadcast already fans out across endpoints internally.
-	var accepted, rejected, retryable int
-	var mu sync.Mutex
-	sem := make(chan struct{}, fallbackParallelism)
-	var wg sync.WaitGroup
-	for i, msg := range chunk {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			br := p.broadcastSingleToEndpoints(ctx, rawTxs[i], msg.TXID)
-			out[i] = txResult{status: br.Status, errMsg: br.ErrorMsg, rawTx: msg.RawTx, successEndpoint: br.SuccessEndpoint, acknowledged: br.Acknowledged}
-			mu.Lock()
-			defer mu.Unlock()
-			switch {
-			case br.Status == nil:
-				// no verdict (202 or all timed out)
-			case br.Status.Status == models.StatusAcceptedByNetwork:
-				accepted++
-			case br.Status.Status == models.StatusRejected:
-				if IsRetryableError(br.ErrorMsg) {
-					retryable++
-				} else {
-					rejected++
-				}
-			}
-		}()
-	}
-	wg.Wait()
-	p.logger.Info(
-		"per-tx fallback complete",
-		zap.Int("chunk_size", len(chunk)),
-		zap.Int("accepted", accepted),
-		zap.Int("rejected", rejected),
-		zap.Int("retryable", retryable),
-	)
-}
-
-// broadcastResult holds the outcome of a single-tx broadcast across all endpoints.
-type broadcastResult struct {
-	Status          *models.TransactionStatus
-	ErrorMsg        string // best error message from endpoints (for retryable classification)
-	SuccessEndpoint string // URL of the peer that accepted the tx (empty if none did)
-	// Acknowledged is true when at least one endpoint responded with 2xx
-	// (200 OK or 202 Accepted). Distinguishes "peer received the tx but
-	// won't issue a definitive verdict yet" (Status=nil, Acknowledged=true)
-	// from "no peer was reachable" (Status=nil, Acknowledged=false). The
-	// former is in-flight and shouldn't be retried; the latter must go to
-	// PENDING_RETRY or the tx stays stuck in RECEIVED forever.
-	Acknowledged bool
-}
-
-// inlineRetryAttempts is the number of *additional* attempts to make after
-// the first broadcast fails with a retryable error. Total attempts therefore
-// are inlineRetryAttempts+1. Kept small because each attempt already fans out
-// across all healthy endpoints; the goal is to ride out transient network
-// blips without waiting the full reaper_interval for PENDING_RETRY.
-const inlineRetryAttempts = 2
-
-// inlineRetryDelay is the base sleep between inline retry attempts.
-var inlineRetryDelay = 100 * time.Millisecond
-
-// broadcastSingleToEndpoints submits a single transaction to each healthy
-// teranode endpoint using POST /tx. On the first accepting endpoint (200 OK)
-// the shared broadcast context is canceled so slower sibling requests don't
-// gate wall-time on the slowest peer. Per-endpoint outcomes are recorded into
-// the teranode client's circuit-breaker so repeatedly failing peers are
-// sidelined from future broadcasts.
-//
-// Transient all-failure broadcasts (every endpoint returned a retryable error)
-// are retried inline up to inlineRetryAttempts times before returning, so a
-// brief network blip doesn't force a 30s PENDING_RETRY trip.
-func (p *Propagator) broadcastSingleToEndpoints(ctx context.Context, rawTx []byte, txid string) broadcastResult {
-	var result broadcastResult
-	attempt := 0
-	for ; attempt <= inlineRetryAttempts; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return result
-			case <-time.After(time.Duration(attempt) * inlineRetryDelay):
-			}
-		}
-		result = p.broadcastSingleOnce(ctx, rawTx, txid)
-		// Accepted (200) or no-verdict (202/all timeouts) — no point retrying.
-		if result.SuccessEndpoint != "" || result.Status == nil {
-			if attempt > 0 {
-				metrics.PropagationInlineRetryTotal.WithLabelValues("recovered").Inc()
-			}
-			return result
-		}
-		// Only retry if the aggregate outcome looks transient. Non-retryable
-		// rejections are terminal and stay terminal.
-		if !IsRetryableError(result.ErrorMsg) {
-			return result
-		}
-	}
-	metrics.PropagationInlineRetryTotal.WithLabelValues("exhausted").Inc()
-	return result
-}
-
-// broadcastSingleOnce is one attempt of a single-tx broadcast. Split out so
-// broadcastSingleToEndpoints can loop around it for inline retries.
-func (p *Propagator) broadcastSingleOnce(ctx context.Context, rawTx []byte, txid string) broadcastResult {
-	start := time.Now()
-	defer func() {
-		metrics.PropagationBroadcastDuration.WithLabelValues("single").Observe(time.Since(start).Seconds())
-	}()
-	endpoints := p.teranodeClient.GetHealthyEndpoints()
-	if len(endpoints) == 0 {
-		p.logger.Error("no healthy teranode endpoints")
-		return broadcastResult{}
-	}
-
-	submitCtx, cancelSubmit := context.WithTimeout(ctx, 15*time.Second)
-	defer cancelSubmit()
-	broadcastCtx, cancelBroadcast := context.WithCancel(submitCtx)
-	defer cancelBroadcast()
-
-	// Submit one job per endpoint to the persistent worker pool. resultCh is
-	// sized to len(endpoints) so worker sends never block. The for-range
-	// drains exactly len(endpoints) results before exiting — no separate
-	// goroutine to close the channel.
-	resultCh := make(chan broadcastJobResult, len(endpoints))
-	submitted := p.submitBroadcastJobs(broadcastCtx, endpoints, rawTx, nil, resultCh)
-
-	// Collect every non-canceled result first so the circuit-breaker can
-	// reason about the whole broadcast attempt at once (network-consensus
-	// detection). Per-result aggregation of bestStatus stays in the loop —
-	// we still need it to decide the tx's status update.
-	outcomes := make([]endpointOutcome, 0, submitted)
-	var bestStatus models.Status
-	var lastErrMsg string
-	var successEndpoint string
-	acknowledged := false
-	for i := 0; i < submitted; i++ {
-		result := <-resultCh
-		// A sibling request canceled by a winning race is not a real failure —
-		// the peer didn't misbehave, we called off the race. Skip health
-		// recording and status aggregation for that case.
-		if isCanceledByBroadcast(broadcastCtx, result.err) {
-			continue
-		}
-		outcomes = append(outcomes, endpointOutcome{endpoint: result.endpoint, statusCode: result.statusCode})
-		if result.err != nil {
-			lastErrMsg = result.err.Error()
-			if statusPriority(models.StatusRejected) > statusPriority(bestStatus) {
-				bestStatus = models.StatusRejected
-			}
-			continue
-		}
-		switch result.statusCode {
-		case http.StatusOK:
-			acknowledged = true
-			if statusPriority(models.StatusAcceptedByNetwork) > statusPriority(bestStatus) {
-				bestStatus = models.StatusAcceptedByNetwork
-				successEndpoint = result.endpoint
-			}
-			// Early-cancel: the first 200 is the verdict. Sibling requests
-			// observe broadcastCtx.Err() and return quickly.
-			cancelBroadcast()
-		case http.StatusAccepted:
-			// 202 means the peer accepted the tx but won't tell us yet —
-			// matching original behavior, no tx-level status update, but
-			// flag Acknowledged so the caller knows the tx reached a peer.
-			acknowledged = true
-			cancelBroadcast()
-		}
-	}
-	recordBroadcastOutcomes(p.teranodeClient, outcomes)
-
-	if bestStatus == "" {
-		return broadcastResult{Acknowledged: acknowledged}
-	}
-
-	return broadcastResult{
-		Status: &models.TransactionStatus{
-			TxID:      txid,
-			Status:    bestStatus,
-			Timestamp: time.Now(),
-		},
-		ErrorMsg:        lastErrMsg,
-		SuccessEndpoint: successEndpoint,
-		Acknowledged:    acknowledged,
-	}
+	metrics.PropagationChunkTotal.WithLabelValues("none").Inc()
+	results, _ := p.broadcastBatchToEndpoints(ctx, rawTxs, chunk)
+	copy(out, results)
 }
 
 // isCanceledByBroadcast reports whether err is a context.Canceled directly
@@ -1015,28 +1029,15 @@ type endpointOutcome struct {
 }
 
 // recordBroadcastOutcomes applies circuit-breaker accounting to a complete
-// set of per-endpoint outcomes from one broadcast attempt. Distinguishes
-// peer-health signals from network-consensus signals so persistent invalid
-// tx submissions don't progressively sideline every peer:
+// set of per-endpoint outcomes from one broadcast attempt:
 //
-//   - statusCode == 0 (no HTTP response): always RecordFailure. Reachability
-//     is per-peer; one stuck DNS or transport doesn't speak to the network.
-//   - At least one 2xx in the set: classic mode. Each non-2xx peer is
-//     penalized via RecordBroadcastFailure (they disagreed with a peer who
-//     accepted — they're the outliers), each 2xx peer is credited.
-//   - Zero 2xx but every responder returned non-2xx: unanimous network
-//     reject. The peers are doing their job (responding) and they all agree
-//     the tx is bad — penalizing them would punish the messenger. Treat as
-//     RecordSuccess for the responding peers. Transport errors still get
-//     RecordFailure (they didn't respond at all).
-//
-// The intent of the unanimous-reject branch is the resilience tunable from
-// the 02:07 EDT incident: when the tx generator produces a double-spend
-// storm, every honest peer returns 500 "failed to validate" and the old
-// per-result code sidelined them all, leaving us with zero healthy peers
-// and 1.6M no_verdict outcomes. With this branch, peers stay healthy and
-// the txs flow through to UpdateStatus(REJECTED) — the correct signal that
-// our outgoing payload is the problem.
+//   - statusCode == 0 (no HTTP response): RecordFailure (per-peer reachability).
+//   - At least one 2xx in the set: each non-2xx is RecordBroadcastFailure,
+//     each 2xx is RecordSuccess.
+//   - Zero 2xx but every responder returned non-2xx: unanimous network reject.
+//     The peers responded and they all agree the tx is bad — don't penalize
+//     them for being correct. RecordSuccess for responders, RecordFailure for
+//     transport errors.
 func recordBroadcastOutcomes(tc *teranode.Client, outcomes []endpointOutcome) {
 	if len(outcomes) == 0 {
 		return
@@ -1080,22 +1081,24 @@ func recordBroadcastOutcomes(tc *teranode.Client, outcomes []endpointOutcome) {
 
 // submitBroadcastJobs enqueues one broadcast job per endpoint to the
 // persistent worker pool, returning the number of jobs actually queued.
-// Exactly one of rawTx (single /tx) or rawTxs (batch /txs) must be non-nil.
+// Each job POSTs the same rawTxs slice to its endpoint.
 //
-// If the job channel is full or nil (tests construct Propagator without
-// Start() — broadcastJobs is initialized in New but the pool may not be
-// running), this falls back to spawning a one-shot goroutine per endpoint
-// so behavior matches the persistent-pool path. Result channel ordering is
-// independent of submission order, which is fine — callers aggregate by
-// endpoint, not position.
-func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string, rawTx []byte, rawTxs [][]byte, resultCh chan<- broadcastJobResult) int {
+// Sends block on the worker pool's job channel — when the pool is
+// saturated, backpressure flows back to the caller (and ultimately to
+// the dispatcher's pendingMsgs cap). ctx cancellation unblocks a stuck
+// send so shutdown and per-claim revocation observe the cancel.
+//
+// In tests that construct a Propagator without Start() (broadcastRunning
+// stays false), the channel is unbuffered for delivery and falls through
+// to a per-endpoint goroutine — preserves test ergonomics without
+// affecting production behavior.
+func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string, rawTxs [][]byte, resultCh chan<- broadcastJobResult) int {
 	submitted := 0
 	useChannel := p.broadcastRunning.Load()
 	for _, endpoint := range endpoints {
 		job := broadcastJob{
 			ctx:      ctx,
 			endpoint: endpoint,
-			rawTx:    rawTx,
 			rawTxs:   rawTxs,
 			resultCh: resultCh,
 		}
@@ -1104,22 +1107,15 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 			case p.broadcastJobs <- job:
 				submitted++
 				continue
-			default:
-				// Pool saturated — fall through to goroutine spawn so the
-				// flush path can still progress.
+			case <-ctx.Done():
+				return submitted
 			}
 		}
 		submitted++
 		go func(j broadcastJob) {
-			var statusCode int
-			var err error
-			if j.rawTxs != nil {
-				statusCode, err = p.teranodeClient.SubmitTransactions(j.ctx, j.endpoint, j.rawTxs)
-			} else {
-				statusCode, err = p.teranodeClient.SubmitTransaction(j.ctx, j.endpoint, j.rawTx)
-			}
+			statusCode, failures, err := p.teranodeClient.SubmitTransactions(j.ctx, j.endpoint, j.rawTxs)
 			select {
-			case j.resultCh <- broadcastJobResult{endpoint: j.endpoint, statusCode: statusCode, err: err}:
+			case j.resultCh <- broadcastJobResult{endpoint: j.endpoint, statusCode: statusCode, failures: failures, err: err}:
 			default:
 			}
 		}(job)
@@ -1127,23 +1123,36 @@ func (p *Propagator) submitBroadcastJobs(ctx context.Context, endpoints []string
 	return submitted
 }
 
-// broadcastBatchToEndpoints submits all transactions to each healthy teranode
-// endpoint using the batch POST /txs endpoint. Binary outcome matches the
-// original: any endpoint success → AcceptedByNetwork for all, all fail →
-// Rejected for all. The first accepting endpoint cancels sibling requests so
-// a slow peer doesn't gate wall-time. Per-endpoint outcomes are recorded into
-// the circuit-breaker regardless of the batch verdict. The returned
-// successEndpoint is the URL of the first peer that accepted the batch (empty
-// if none did) — surfaced so operator logs can show which peer served a batch.
-func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) (statuses []*models.TransactionStatus, successEndpoint string) {
+// broadcastBatchToEndpoints submits a batch to each healthy teranode
+// endpoint via /txs and produces per-tx classifications:
+//
+//   - Any endpoint returning 200 → every tx accepted (the peer accepted
+//     the whole batch; per-tx failure info from other peers' 500 responses
+//     is superseded).
+//   - No endpoint returned 200, but at least one returned the Teranode
+//     "Failed to process transactions:" 500 body → per-tx classification.
+//     Each txid named in the failure body is rejected (terminal Teranode
+//     code) or requeued (infra-bucket code); every other tx in the batch
+//     is treated as accepted.
+//   - All endpoints failed without a parseable Teranode failure body, or
+//     no healthy endpoints existed → every tx requeued (pure batch-level
+//     infra failure).
+//
+// Per-endpoint outcomes are recorded into the circuit-breaker regardless
+// of verdict so a peer returning 500 doesn't get sidelined when the
+// 500 was a per-tx verdict, not the peer's fault. The returned
+// successEndpoint is the URL of the first peer that accepted the batch
+// (empty when none did).
+func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]byte, batch []propagationMsg) (results []txResult, successEndpoint string) {
 	start := time.Now()
 	defer func() {
 		metrics.PropagationBroadcastDuration.WithLabelValues("batch").Observe(time.Since(start).Seconds())
 	}()
+	now := time.Now()
 	endpoints := p.teranodeClient.GetHealthyEndpoints()
 	if len(endpoints) == 0 {
 		p.logger.Error("no healthy teranode endpoints")
-		return make([]*models.TransactionStatus, len(batch)), ""
+		return makeRequeueResults(batch), ""
 	}
 
 	submitCtx, cancelSubmit := context.WithTimeout(ctx, 15*time.Second)
@@ -1152,14 +1161,11 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 	defer cancelBroadcast()
 
 	resultCh := make(chan broadcastJobResult, len(endpoints))
-	submitted := p.submitBroadcastJobs(broadcastCtx, endpoints, nil, rawTxs, resultCh)
+	submitted := p.submitBroadcastJobs(broadcastCtx, endpoints, rawTxs, resultCh)
 
-	// Collect every non-canceled result first so the circuit-breaker can
-	// distinguish "peer disagrees" (one of many failed) from "network
-	// rejects this batch" (all responding peers agreed it's bad). The
-	// latter case must NOT penalize the peers — they're behaving correctly.
 	outcomes := make([]endpointOutcome, 0, submitted)
 	anySuccess := false
+	var failures map[string]string // first endpoint's failure map, used when no peer succeeded
 	for i := 0; i < submitted; i++ {
 		result := <-resultCh
 		if isCanceledByBroadcast(broadcastCtx, result.err) {
@@ -1174,6 +1180,10 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 				zap.Int("status_code", result.statusCode),
 				zap.Error(result.err),
 			)
+			// Save the first parseable failure map we see for the fallback path.
+			if failures == nil && len(result.failures) > 0 {
+				failures = result.failures
+			}
 			continue
 		}
 		p.logger.Debug(
@@ -1185,8 +1195,8 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 			successEndpoint = result.endpoint
 		}
 		anySuccess = true
-		// Early-cancel: binary verdict is already known once any endpoint
-		// accepts; siblings running against slow peers stop wasting time.
+		// Early-cancel: an accepting endpoint settles the batch's network
+		// verdict; siblings still in flight stop wasting time.
 		cancelBroadcast()
 	}
 	recordBroadcastOutcomes(p.teranodeClient, outcomes)
@@ -1198,66 +1208,83 @@ func (p *Propagator) broadcastBatchToEndpoints(ctx context.Context, rawTxs [][]b
 		zap.Int("endpoint_count", len(endpoints)),
 	)
 
-	now := time.Now()
-	statuses = make([]*models.TransactionStatus, len(batch))
-	status := models.StatusRejected
+	results = make([]txResult, len(batch))
+
 	if anySuccess {
-		status = models.StatusAcceptedByNetwork
+		// Network accepted — every tx becomes ACCEPTED_BY_NETWORK.
+		for i, msg := range batch {
+			results[i] = txResult{
+				class: txResultClassAccepted,
+				status: &models.TransactionStatus{
+					TxID:      msg.TXID,
+					Status:    models.StatusAcceptedByNetwork,
+					Timestamp: now,
+				},
+				rawTx:           msg.RawTx,
+				successEndpoint: successEndpoint,
+			}
+		}
+		return results, successEndpoint
 	}
+
+	if failures != nil {
+		// All endpoints failed but at least one carried a Teranode
+		// failure-list body. A txid in the map failed; absent means the
+		// peer accepted that tx into its pipeline.
+		for i, msg := range batch {
+			line, failed := failures[strings.ToLower(msg.TXID)]
+			if !failed {
+				results[i] = txResult{
+					class: txResultClassAccepted,
+					status: &models.TransactionStatus{
+						TxID:      msg.TXID,
+						Status:    models.StatusAcceptedByNetwork,
+						Timestamp: now,
+					},
+					rawTx: msg.RawTx,
+				}
+				continue
+			}
+			class, errMsg := classifyFailureLine(line)
+			switch class {
+			case txResultClassRejected:
+				results[i] = txResult{
+					class:  txResultClassRejected,
+					errMsg: errMsg,
+					status: &models.TransactionStatus{
+						TxID:      msg.TXID,
+						Status:    models.StatusRejected,
+						Timestamp: now,
+						ExtraInfo: errMsg,
+					},
+					rawTx: msg.RawTx,
+				}
+			default:
+				results[i] = txResult{
+					class:  txResultClassRequeue,
+					errMsg: errMsg,
+					rawTx:  msg.RawTx,
+				}
+			}
+		}
+		return results, ""
+	}
+
+	// All endpoints failed and none had a parseable Teranode failure body —
+	// treat the whole batch as infra and requeue every tx.
+	return makeRequeueResults(batch), ""
+}
+
+// makeRequeueResults builds a per-tx requeue result list for a batch
+// that hit a pure infra failure (no healthy endpoints, no parseable
+// per-slot body, etc.).
+func makeRequeueResults(batch []propagationMsg) []txResult {
+	results := make([]txResult, len(batch))
 	for i, msg := range batch {
-		statuses[i] = &models.TransactionStatus{
-			TxID:      msg.TXID,
-			Status:    status,
-			Timestamp: now,
+		results[i] = txResult{
+			class: txResultClassRequeue,
+			rawTx: msg.RawTx,
 		}
 	}
-
-	return statuses, successEndpoint
-}
-
-// handleRetryableFailure marks a tx for durable retry. The two-call pattern
-// (BumpRetryCount then SetPendingRetryFields) lets us compute the real
-// exponential backoff from the post-increment count without double-
-// incrementing. If retry_count exceeds retryMaxAttempts, the tx is rejected
-// immediately and its retry bins are cleared.
-func (p *Propagator) handleRetryableFailure(ctx context.Context, txid string, rawTx []byte) {
-	retryCount, err := p.store.BumpRetryCount(ctx, txid)
-	if err != nil {
-		p.logger.Error("failed to bump retry count", zap.String("txid", txid), zap.Error(err))
-		return
-	}
-
-	if retryCount > p.retryMaxAttempts {
-		if err := p.store.ClearRetryState(ctx, txid, models.StatusRejected, "broadcast retries exhausted"); err != nil {
-			p.logger.Error("failed to reject after retries exhausted", zap.String("txid", txid), zap.Error(err))
-		}
-		return
-	}
-
-	nextRetryAt := ComputeBackoff(p.retryBackoffMs, retryCount)
-	if err := p.store.SetPendingRetryFields(ctx, txid, rawTx, nextRetryAt); err != nil {
-		p.logger.Error("failed to set pending retry fields", zap.String("txid", txid), zap.Error(err))
-		return
-	}
-
-	p.logger.Debug(
-		"transaction queued for retry",
-		zap.String("txid", txid),
-		zap.Int("attempt", retryCount),
-		zap.Time("next_retry_at", nextRetryAt),
-	)
-}
-
-// statusPriority returns a numeric priority for broadcast result aggregation.
-func statusPriority(s models.Status) int {
-	switch s {
-	case models.StatusAcceptedByNetwork:
-		return 3
-	case models.StatusSentToNetwork:
-		return 2
-	case models.StatusRejected:
-		return 1
-	default:
-		return 0
-	}
+	return results
 }

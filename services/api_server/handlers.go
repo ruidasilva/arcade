@@ -24,6 +24,24 @@ import (
 	"github.com/bsv-blockchain/arcade/teranode"
 )
 
+// collectInputTXIDs returns the parent txids referenced by every input of
+// tx. Empty for coinbase. Used to populate the propagation envelope's
+// input_txids field so the dispatcher can detect parent-child
+// relationships without re-parsing the raw bytes downstream.
+func collectInputTXIDs(tx *sdkTx.Transaction) []string {
+	if tx == nil || len(tx.Inputs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(tx.Inputs))
+	for _, in := range tx.Inputs {
+		if in == nil || in.SourceTXID == nil {
+			continue
+		}
+		out = append(out, in.SourceTXID.String())
+	}
+	return out
+}
+
 const jsonKeyError = "error"
 
 // submitOptions captures the callback subscription preferences a client
@@ -577,19 +595,76 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	// and re-encode it downstream.
 	txid := parsedTx.TxID().String()
 
-	// Record the subscription BEFORE publishing to Kafka so the validator's
-	// RECEIVED status (and any subsequent updates) can find a matching
-	// submission row when the webhook service / SSE catchup queries by
-	// txid or callbackToken. A late InsertSubmission would race with the
-	// validator and risk silently dropping the first few status events for
-	// fast-path transactions.
+	// Synchronous policy validation (skipFees=true, skipScripts=true) — fee and
+	// script checks remain Teranode's job. Validation failure writes a
+	// terminal REJECTED row to the store and returns 400 to the client
+	// so the failure is durable AND immediate.
+	if s.validator != nil {
+		if err := s.validator.ValidateTransaction(c.Request.Context(), parsedTx, true, true); err != nil {
+			s.rejectAtIntake(c.Request.Context(), txid, err.Error(), opts)
+			c.JSON(http.StatusBadRequest, gin.H{
+				jsonKeyError: "transaction failed validation",
+				"reason":     err.Error(),
+			})
+			return
+		}
+	}
+
+	// Dedup CAS via GetOrInsertStatus. Two submitters racing on the
+	// same txid both attempt the insert; the loser sees inserted=false
+	// and returns 202 idempotently without re-publishing.
+	if s.store != nil {
+		row := &models.TransactionStatus{
+			TxID:      txid,
+			Status:    models.StatusReceived,
+			Timestamp: time.Now(),
+			// Carry the raw bytes on the status row so the propagation
+			// reaper can rebroadcast txs that are stuck in non-terminal
+			// states without re-fetching from Kafka or the API caller.
+			RawTx: rawTx,
+		}
+		existing, inserted, dedupErr := s.store.GetOrInsertStatus(c.Request.Context(), row)
+		switch {
+		case dedupErr != nil:
+			s.logger.Error("dedup CAS failed", zap.String("txid", txid), zap.Error(dedupErr))
+			// Best-effort: continue with publish. The propagator's
+			// in-flight set catches duplicates that slip past.
+		case !inserted && existing != nil:
+			// Idempotent re-submit: row already exists. Register the txid
+			// with the in-process TxTracker using the persisted status so
+			// bump-builder's tracked-only filtering recognizes it. Without
+			// this, a re-submit after process restart leaves the tx
+			// invisible to bump-builder and subsequent MINED/IMMUTABLE
+			// transitions are silently dropped.
+			if s.txTracker != nil {
+				s.txTracker.Add(txid, existing.Status)
+			}
+			s.recordSubmission(c.Request.Context(), txid, opts)
+			c.JSON(http.StatusAccepted, gin.H{
+				"status": "already submitted",
+				"txid":   txid,
+				"state":  string(existing.Status),
+			})
+			return
+		}
+	}
+
+	// Register the tx with the in-process TxTracker so the bump-builder
+	// recognizes it when its block is processed.
+	if s.txTracker != nil {
+		s.txTracker.Add(txid, models.StatusReceived)
+	}
+
+	// Record the callback subscription BEFORE publishing to Kafka so
+	// any status events fired on this txid can find a matching row.
 	s.recordSubmission(c.Request.Context(), txid, opts)
 
 	msg := map[string]interface{}{
-		"action": "submit",
-		"raw_tx": rawTx,
+		"txid":        txid,
+		"raw_tx":      rawTx,
+		"input_txids": collectInputTXIDs(parsedTx),
 	}
-	if err := s.producer.Send(kafka.TopicTransaction, txid, msg); err != nil {
+	if err := s.producer.Send(kafka.TopicPropagation, txid, msg); err != nil {
 		if errors.Is(err, kafka.ErrBrokerBackpressure) {
 			// Backpressure → shed load to the client. The tx was never queued,
 			// so a retry is safe and is the contract the 503 expresses.
@@ -606,7 +681,83 @@ func (s *Server) handleSubmitTransaction(c *gin.Context) {
 	c.JSON(http.StatusAccepted, gin.H{"status": "submitted"})
 }
 
+// rejectAtIntake is the terminal-rejection counterpart to the intake
+// success sequence. It persists a REJECTED row, records the submission
+// so SSE/webhook can resolve the callback URL+token on delivery, then
+// publishes the REJECTED status to TopicStatusUpdate so live
+// subscribers see the terminal outcome. Every step is best-effort —
+// the client has already received its 400 by the time this runs, so a
+// store or publish failure does not change the HTTP outcome.
+//
+// Order matches the success path: persist row, then queue submission,
+// then publish. Queuing the submission before the publish minimizes
+// the window in which an SSE/webhook subscriber receives the event
+// without a matching submission row (the recorder pool is async, so
+// the window can't be eliminated entirely without making the row
+// write synchronous — a trade-off the success path also accepts).
+func (s *Server) rejectAtIntake(ctx context.Context, txid, reason string, opts submitOptions) {
+	s.persistRejectedAtIntake(ctx, txid, reason)
+	s.recordSubmission(ctx, txid, opts)
+	if s.publisher == nil {
+		return
+	}
+	status := &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusRejected,
+		ExtraInfo: reason,
+		Timestamp: time.Now(),
+	}
+	if err := s.publisher.Publish(ctx, status); err != nil {
+		s.logger.Warn(
+			"intake rejection publish failed",
+			zap.String("txid", txid),
+			zap.Error(err),
+		)
+	}
+}
+
+// persistRejectedAtIntake writes a terminal REJECTED row for a tx that
+// failed validation at the intake handler. Best-effort: a write
+// failure is logged but doesn't change the client response (the 400
+// has already told them the tx was rejected). When the store is nil
+// (test setups using struct-literal construction), this is a no-op.
+func (s *Server) persistRejectedAtIntake(ctx context.Context, txid, reason string) {
+	if s.store == nil {
+		return
+	}
+	row := &models.TransactionStatus{
+		TxID:      txid,
+		Status:    models.StatusRejected,
+		ExtraInfo: reason,
+		Timestamp: time.Now(),
+	}
+	_, inserted, err := s.store.GetOrInsertStatus(ctx, row)
+	if err != nil {
+		s.logger.Warn(
+			"intake rejection persist failed",
+			zap.String("txid", txid),
+			zap.Error(err),
+		)
+		return
+	}
+	if !inserted {
+		if err := s.store.UpdateStatus(ctx, row); err != nil {
+			s.logger.Warn(
+				"intake rejection status update failed",
+				zap.String("txid", txid),
+				zap.Error(err),
+			)
+		}
+	}
+}
+
 // handleSubmitTransactions accepts a batch of concatenated raw transactions.
+// Mirrors handleSubmitTransaction's intake pipeline (parse → validate →
+// dedup CAS → publish to TopicPropagation) for each tx in the batch. The
+// publish is a single SendBatch so all txs in one HTTP request hit the
+// in-memory broker as one fan-out. Each tx carries its input_txids so
+// the propagation dispatcher can detect parent-child relationships and
+// hold children until their parents have terminalized.
 func (s *Server) handleSubmitTransactions(c *gin.Context) {
 	if !strings.Contains(c.ContentType(), "octet-stream") {
 		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "Content-Type must be application/octet-stream"})
@@ -632,67 +783,150 @@ func (s *Server) handleSubmitTransactions(c *gin.Context) {
 		return
 	}
 
-	// Phase 1: Parse all transactions upfront. We use the parsed tx's
-	// canonical TxID() for the Kafka key (and submissions row) so it matches
-	// what the validator emits later — hashing the wire bytes directly would
-	// be wrong for Extended Format submissions.
-	var msgs []kafka.KeyValue
+	// Phase 1: parse the whole stream. Use the canonical TxID() (not a
+	// hash of the wire bytes) so Extended Format submissions key the
+	// same as the canonical txid the propagator broadcasts.
+	type parsedItem struct {
+		tx   *sdkTx.Transaction
+		raw  []byte
+		txid string
+	}
+	var parsed []parsedItem
 	offset := 0
 	for offset < len(body) {
-		parsedTx, bytesUsed, parseErr := sdkTx.NewTransactionFromStream(body[offset:])
+		tx, bytesUsed, parseErr := sdkTx.NewTransactionFromStream(body[offset:])
 		if parseErr != nil {
 			s.logger.Error(
 				"failed to parse transaction in batch",
 				zap.Int("offset", offset),
-				zap.Int("parsed", len(msgs)),
+				zap.Int("parsed", len(parsed)),
 				zap.Error(parseErr),
 			)
-			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to parse transaction", "parsed": len(msgs)})
+			c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "failed to parse transaction", "parsed": len(parsed)})
 			return
 		}
 		if bytesUsed == 0 {
 			break
 		}
-
-		rawTxBytes := body[offset : offset+bytesUsed]
-		msgs = append(msgs, kafka.KeyValue{
-			Key: parsedTx.TxID().String(),
-			Value: map[string]interface{}{
-				"action": "submit",
-				"raw_tx": rawTxBytes,
-			},
+		parsed = append(parsed, parsedItem{
+			tx:   tx,
+			raw:  body[offset : offset+bytesUsed],
+			txid: tx.TxID().String(),
 		})
 		offset += bytesUsed
 	}
-
-	if len(msgs) == 0 {
+	if len(parsed) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{jsonKeyError: "no transactions parsed"})
 		return
 	}
 
-	// Record one submission per parsed txid before the batch publish so the
-	// downstream services can resolve callback preferences as soon as
-	// status updates start flowing back. opts was extracted (and the URL
-	// validated) at the top of the handler.
-	if opts.hasSubscription() {
+	// Phase 2: synchronous policy validation per tx. Any failure aborts
+	// the whole batch with 400 — matches the single-tx contract. The
+	// failed tx gets a durable REJECTED row before the response so
+	// SSE/webhook subscribers can resolve the outcome.
+	if s.validator != nil {
 		ctx := c.Request.Context()
-		for _, m := range msgs {
-			s.recordSubmission(ctx, m.Key, opts)
+		for _, p := range parsed {
+			if vErr := s.validator.ValidateTransaction(ctx, p.tx, true, true); vErr != nil {
+				s.rejectAtIntake(ctx, p.txid, vErr.Error(), opts)
+				c.JSON(http.StatusBadRequest, gin.H{
+					jsonKeyError: "transaction failed validation",
+					"txid":       p.txid,
+					"reason":     vErr.Error(),
+				})
+				return
+			}
 		}
 	}
 
-	// Phase 2: Batch publish all parsed transactions in one call
-	if err := s.producer.SendBatch(kafka.TopicTransaction, msgs); err != nil {
-		if errors.Is(err, kafka.ErrBrokerBackpressure) {
-			s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
-			c.Header("Retry-After", "1")
-			c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
+	// Phase 3: dedup CAS per tx. Duplicates are skipped from the
+	// publish but counted in the response so the caller can reconcile.
+	// A dedup error logs but doesn't drop the tx — matches single-tx
+	// best-effort behavior.
+	toPublish := make([]parsedItem, 0, len(parsed))
+	duplicates := 0
+	if s.store != nil {
+		ctx := c.Request.Context()
+		for _, p := range parsed {
+			row := &models.TransactionStatus{
+				TxID:      p.txid,
+				Status:    models.StatusReceived,
+				Timestamp: time.Now(),
+				// Carry the raw bytes on the row so the propagation
+				// reaper can rebroadcast stuck txs without re-fetching.
+				RawTx: p.raw,
+			}
+			existing, inserted, dedupErr := s.store.GetOrInsertStatus(ctx, row)
+			switch {
+			case dedupErr != nil:
+				s.logger.Error("dedup CAS failed", zap.String("txid", p.txid), zap.Error(dedupErr))
+				toPublish = append(toPublish, p)
+			case !inserted && existing != nil:
+				duplicates++
+				// Idempotent re-submit: register the txid with the
+				// in-process TxTracker using the persisted status so
+				// bump-builder's tracked-only filtering recognizes it.
+				// Mirrors the single-submit dedup branch (handleSubmitTransaction).
+				if s.txTracker != nil {
+					s.txTracker.Add(p.txid, existing.Status)
+				}
+				s.recordSubmission(ctx, p.txid, opts)
+			default:
+				toPublish = append(toPublish, p)
+			}
+		}
+	} else {
+		toPublish = parsed
+	}
+
+	// Register every accepted tx with the in-process TxTracker so the
+	// bump-builder's filterTrackedTxids recognizes them when their block
+	// is processed. Without this, tracked-only fan-out drops every MINED
+	// transition and txs stay stuck at SEEN_ON_NETWORK forever.
+	if s.txTracker != nil {
+		for _, p := range toPublish {
+			s.txTracker.Add(p.txid, models.StatusReceived)
+		}
+	}
+
+	// Record subscriptions BEFORE publishing so any status events that
+	// fire on these txids find a matching row.
+	ctx := c.Request.Context()
+	for _, p := range toPublish {
+		s.recordSubmission(ctx, p.txid, opts)
+	}
+
+	// Phase 4: build propagation envelopes and publish as one batch.
+	// input_txids drives the dispatcher's dep-aware admission — children
+	// of any in-flight parent are held until the parent terminalizes.
+	if len(toPublish) > 0 {
+		msgs := make([]kafka.KeyValue, 0, len(toPublish))
+		for _, p := range toPublish {
+			msgs = append(msgs, kafka.KeyValue{
+				Key: p.txid,
+				Value: map[string]interface{}{
+					"txid":        p.txid,
+					"raw_tx":      p.raw,
+					"input_txids": collectInputTXIDs(p.tx),
+				},
+			})
+		}
+		if err := s.producer.SendBatch(kafka.TopicPropagation, msgs); err != nil {
+			if errors.Is(err, kafka.ErrBrokerBackpressure) {
+				s.logger.Warn("batch submit rejected: kafka backpressure", zap.Int("count", len(msgs)))
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusServiceUnavailable, gin.H{jsonKeyError: "service overloaded, retry shortly"})
+				return
+			}
+			s.logger.Error("failed to publish transaction batch", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
 			return
 		}
-		s.logger.Error("failed to publish transaction batch", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{jsonKeyError: "failed to submit"})
-		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"submitted": len(msgs)})
+	c.JSON(http.StatusAccepted, gin.H{
+		"submitted":  len(toPublish),
+		"duplicates": duplicates,
+		"total":      len(parsed),
+	})
 }

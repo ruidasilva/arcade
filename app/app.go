@@ -30,7 +30,6 @@ import (
 	"github.com/bsv-blockchain/arcade/services/p2p_client"
 	"github.com/bsv-blockchain/arcade/services/propagation"
 	"github.com/bsv-blockchain/arcade/services/sse"
-	"github.com/bsv-blockchain/arcade/services/tx_validator"
 	"github.com/bsv-blockchain/arcade/services/watchdog"
 	"github.com/bsv-blockchain/arcade/services/webhook"
 	"github.com/bsv-blockchain/arcade/store"
@@ -78,8 +77,22 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 	}
 	producer := kafka.NewProducer(broker)
 
+	// Hard requirement: TopicPropagation MUST be single-partition. The
+	// dep-aware dispatcher's single-goroutine state ownership relies on
+	// total order at the topic level — parent/child txids on different
+	// partitions would bypass the in-memory dep index and reintroduce
+	// the cross-batch "missing inputs" race we just removed. Check this
+	// on every startup regardless of MinPartitions.
+	if pErr := kafka.CheckExactPartitions(broker, kafka.TopicPropagation, 1, logger); pErr != nil {
+		_ = producer.Close()
+		return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
+	}
+	// MinPartitions is a soft hint for horizontally-scaled topics. There
+	// are currently no other hot-path topics that need it (TopicTransaction
+	// was retired with tx_validator) but the knob is retained so a future
+	// fan-out topic can opt into the check without re-introducing config.
 	if cfg.Kafka.MinPartitions > 1 {
-		if pErr := kafka.CheckPartitions(broker, []string{kafka.TopicTransaction, kafka.TopicPropagation}, cfg.Kafka.MinPartitions, logger); pErr != nil {
+		if pErr := kafka.CheckPartitions(broker, nil, cfg.Kafka.MinPartitions, logger); pErr != nil {
 			_ = producer.Close()
 			return nil, nil, fmt.Errorf("kafka partition check: %w", pErr)
 		}
@@ -110,7 +123,7 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 		ProbeTimeout:              time.Duration(cfg.Propagation.EndpointHealth.ProbeTimeoutMs) * time.Millisecond,
 		MinHealthyEndpoints:       cfg.Propagation.EndpointHealth.MinHealthyEndpoints,
 		RefreshInterval:           time.Duration(cfg.Propagation.EndpointHealth.RefreshIntervalMs) * time.Millisecond,
-		Source:                    endpointSource{st: st, network: cfg.Network},
+		Source:                    endpointSource{st: st, network: cfg.Network, includeDiscovered: cfg.P2P.DatahubDiscovery},
 		Logger:                    logger,
 	})
 
@@ -163,6 +176,37 @@ func Bootstrap(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*De
 			return nil, nil, fmt.Errorf("chaintracks init: %w", ctErr)
 		}
 		chainTracks = ct
+	}
+
+	// Hydrate the TxTracker from the store BEFORE handing it to services.
+	// Without this, a process restart leaves the in-memory tracker empty
+	// and bump-builder's tracked-only filtering silently drops MINED /
+	// IMMUTABLE transitions for any tx that was already in-flight at the
+	// previous shutdown. Chain height is used to skip deeply-confirmed
+	// rows; when chaintracks is disabled we pass 0, which preserves every
+	// MINED row in the tracker — safe (loads a bit more) and the operator
+	// can prune later.
+	var hydrateHeight uint64
+	if chainTracks != nil {
+		hydrateHeight = uint64(chainTracks.GetHeight(ctx))
+	}
+	hydrateStart := time.Now()
+	loaded, hydrateErr := txTracker.LoadFromStore(ctx, st, hydrateHeight)
+	if hydrateErr != nil {
+		logger.Warn(
+			"tx tracker hydration partial",
+			zap.Int("loaded", loaded),
+			zap.Uint64("current_height", hydrateHeight),
+			zap.Duration("elapsed", time.Since(hydrateStart)),
+			zap.Error(hydrateErr),
+		)
+	} else {
+		logger.Info(
+			"tx tracker hydrated",
+			zap.Int("loaded", loaded),
+			zap.Uint64("current_height", hydrateHeight),
+			zap.Duration("elapsed", time.Since(hydrateStart)),
+		)
 	}
 
 	deps := &Deps{
@@ -247,7 +291,7 @@ func BuildServices(d *Deps) []services.Service {
 	}
 
 	if shouldRun("api-server") {
-		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient))
+		svcs = append(svcs, api_server.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.TeranodeClient, d.MerkleClient, d.Validator))
 	}
 	if shouldRun("bump-builder") {
 		// chainHeader is nil when chaintracks is disabled — bump-builder
@@ -279,9 +323,6 @@ func BuildServices(d *Deps) []services.Service {
 			d.Logger.Info("chaintracks skipped: chaintracks_server.enabled=false (regtest force-disables this)")
 		}
 	}
-	if shouldRun("tx-validator") {
-		svcs = append(svcs, tx_validator.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.TxTracker, d.Validator))
-	}
 	if shouldRun("propagation") {
 		svcs = append(svcs, propagation.New(cfg, d.Logger, d.Producer, d.Publisher, d.Store, d.Leaser, d.TeranodeClient, d.MerkleClient))
 	}
@@ -311,10 +352,14 @@ func (a chaintracksHeaderReader) GetHeaderByHash(ctx context.Context, hash *chai
 // endpointSource adapts store.Store to teranode.EndpointSource by extracting
 // just the URL list. network scopes the listing to the configured Bitcoin
 // network so a store shared across pods (or reused after a network change)
-// never replays peers from a different network.
+// never replays peers from a different network. When includeDiscovered is
+// false (operator disabled p2p.datahub_discovery), rows persisted as
+// source=discovered by prior runs are filtered out — the toggle now means
+// "ignore discovered URLs" end-to-end, not just "stop discovering new ones."
 type endpointSource struct {
-	st      store.Store
-	network string
+	st                store.Store
+	network           string
+	includeDiscovered bool
 }
 
 func (a endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) {
@@ -324,6 +369,9 @@ func (a endpointSource) ListEndpointURLs(ctx context.Context) ([]string, error) 
 	}
 	out := make([]string, 0, len(eps))
 	for _, ep := range eps {
+		if !a.includeDiscovered && ep.Source == store.DatahubEndpointSourceDiscovered {
+			continue
+		}
 		out = append(out, ep.URL)
 	}
 	return out, nil

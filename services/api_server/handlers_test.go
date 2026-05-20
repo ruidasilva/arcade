@@ -26,6 +26,7 @@ import (
 	"github.com/bsv-blockchain/arcade/metrics"
 	"github.com/bsv-blockchain/arcade/models"
 	"github.com/bsv-blockchain/arcade/store"
+	"github.com/bsv-blockchain/arcade/validator"
 )
 
 // mockStore implements store.Store for testing callback handlers.
@@ -57,6 +58,11 @@ type mockStore struct {
 	// batchUpdatePrevFunc lets a test inject previous-row data per-txid for
 	// transition-age assertions. Returning nil mirrors the not-found path.
 	batchUpdatePrevFunc func(txid string) *models.TransactionStatus
+	// getOrInsertFn lets tests drive the dedup CAS path: when non-nil it
+	// is consulted on each GetOrInsertStatus call and its return value is
+	// used directly. Default behavior (nil hook) is the legacy "always
+	// fresh insert" stub: (nil, false, nil).
+	getOrInsertFn func(status *models.TransactionStatus) (*models.TransactionStatus, bool, error)
 }
 
 func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionStatus) error {
@@ -67,7 +73,10 @@ func (m *mockStore) UpdateStatus(_ context.Context, status *models.TransactionSt
 	return nil
 }
 
-func (m *mockStore) GetOrInsertStatus(context.Context, *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+func (m *mockStore) GetOrInsertStatus(_ context.Context, status *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+	if m.getOrInsertFn != nil {
+		return m.getOrInsertFn(status)
+	}
 	return nil, false, nil
 }
 
@@ -352,8 +361,8 @@ func TestHandleSubmitTransactions_BatchPublish(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
 	}
 
 	var resp map[string]interface{}
@@ -406,8 +415,8 @@ func TestHandleSubmitTransactions_100Txs_SingleBatchCall(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
 	}
 
 	var resp map[string]interface{}
@@ -438,6 +447,437 @@ func TestHandleSubmitTransactions_KafkaFailure_Returns500(t *testing.T) {
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleSubmitTransaction_DedupBranch_PopulatesTxTracker pins the
+// invariant that an idempotent re-submit (dedup CAS reports the txid
+// already exists) still registers the txid with the in-process TxTracker
+// using the persisted status. Without this, a client retrying after a
+// process restart would leave the tx invisible to bump-builder's
+// tracked-only filter and silently drop subsequent MINED/IMMUTABLE
+// transitions.
+func TestHandleSubmitTransaction_DedupBranch_PopulatesTxTracker(t *testing.T) {
+	rawTx := makeMinimalTx()
+	parsed, _, err := sdkTx.NewTransactionFromStream(rawTx)
+	if err != nil {
+		t.Fatalf("parsing test tx: %v", err)
+	}
+	wantTxID := parsed.TxID().String()
+
+	const persistedStatus = models.StatusAcceptedByNetwork
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			// Simulate the dedup-loser branch: return the existing row
+			// with its already-persisted status and inserted=false.
+			return &models.TransactionStatus{
+				TxID:   in.TxID,
+				Status: persistedStatus,
+			}, false, nil
+		},
+	}
+	tracker := store.NewTxTracker()
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "already submitted" {
+		t.Errorf("expected status=already submitted, got %v", resp["status"])
+	}
+
+	gotStatus, ok := tracker.GetStatus(wantTxID)
+	if !ok {
+		t.Fatalf("tracker missing dedup'd txid %s — bug would let bump-builder skip MINED transitions after restart", wantTxID)
+	}
+	if gotStatus != persistedStatus {
+		t.Errorf("tracker status = %q, want %q (persisted, not RECEIVED) — a downgrade would mis-represent state", gotStatus, persistedStatus)
+	}
+
+	// Dedup means we must NOT re-publish to Kafka — assert no broadcast
+	// occurred to lock in the idempotency contract.
+	if totalMessages(broker) != 0 {
+		t.Errorf("dedup branch should not publish to Kafka, got %d messages", totalMessages(broker))
+	}
+}
+
+// TestHandleSubmitTransactions_DedupBranch_PopulatesTxTracker is the
+// batch-path mirror of the single-submit dedup test. A batch with one
+// duplicate must add that duplicate to TxTracker with the persisted
+// status while still publishing the non-duplicate txs.
+func TestHandleSubmitTransactions_DedupBranch_PopulatesTxTracker(t *testing.T) {
+	// Two distinct minimal txs so we can route one through the dedup
+	// branch and one through the fresh-insert branch. Encoding two
+	// identical minimal txs back-to-back would parse as two but the
+	// store path keys by txid so we'd just see one dedup hit twice;
+	// distinct txs make the assertion unambiguous.
+	rawA := makeMinimalTx()
+	parsedA, _, err := sdkTx.NewTransactionFromStream(rawA)
+	if err != nil {
+		t.Fatalf("parse A: %v", err)
+	}
+	txidA := parsedA.TxID().String()
+
+	txB := sdkTx.NewTransaction()
+	// Inject a single dummy locking-script output so wire bytes differ
+	// from the empty minimal tx — drives a different txid.
+	txB.AddOutput(&sdkTx.TransactionOutput{
+		Satoshis:      0,
+		LockingScript: &script.Script{},
+	})
+	rawB := txB.Bytes()
+	parsedB, _, err := sdkTx.NewTransactionFromStream(rawB)
+	if err != nil {
+		t.Fatalf("parse B: %v", err)
+	}
+	txidB := parsedB.TxID().String()
+	if txidA == txidB {
+		t.Fatalf("expected distinct txids, got identical %s — adjust txB to ensure divergence", txidA)
+	}
+
+	const persistedStatus = models.StatusSeenMultipleNodes
+	ms := &mockStore{
+		getOrInsertFn: func(in *models.TransactionStatus) (*models.TransactionStatus, bool, error) {
+			if in.TxID == txidA {
+				// A is the duplicate.
+				return &models.TransactionStatus{
+					TxID:   in.TxID,
+					Status: persistedStatus,
+				}, false, nil
+			}
+			// B is the fresh insert (legacy stub semantics).
+			return nil, true, nil
+		},
+	}
+	tracker := store.NewTxTracker()
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		txTracker:      tracker,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	body := append(append([]byte(nil), rawA...), rawB...)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Duplicate (A) must land in the tracker with the persisted status.
+	gotA, okA := tracker.GetStatus(txidA)
+	if !okA {
+		t.Fatalf("tracker missing dedup'd batch txid %s — bug would let bump-builder skip MINED after restart", txidA)
+	}
+	if gotA != persistedStatus {
+		t.Errorf("tracker[A].Status = %q, want %q (persisted, not RECEIVED)", gotA, persistedStatus)
+	}
+
+	// Fresh insert (B) must also be in the tracker (existing behavior;
+	// guards against regressing the non-dedup path).
+	gotB, okB := tracker.GetStatus(txidB)
+	if !okB {
+		t.Fatalf("tracker missing fresh-insert txid %s", txidB)
+	}
+	if gotB != models.StatusReceived {
+		t.Errorf("tracker[B].Status = %q, want RECEIVED", gotB)
+	}
+
+	// Only the non-duplicate (B) is republished — duplicates must not
+	// re-enter the propagation topic.
+	if got := totalMessages(broker); got != 1 {
+		t.Errorf("expected 1 published message (only B), got %d", got)
+	}
+}
+
+// TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes
+// pins the intake-rejection contract: when a tx fails validation, the
+// handler must (1) persist a REJECTED row, (2) queue an InsertSubmission
+// so SSE/webhook can resolve the callback token to a txid, and (3)
+// publish a REJECTED event so live subscribers see the terminal
+// outcome. Without all three, an intake-rejected tx leaves clients
+// silent — no callback, no SSE event — until they manually re-query.
+func TestHandleSubmitTransaction_ValidationFailure_RecordsSubmissionAndPublishes(t *testing.T) {
+	rawTx := makeMinimalTx() // empty tx → ErrNoInputsOrOutputs from ValidatePolicy
+	parsed, _, err := sdkTx.NewTransactionFromStream(rawTx)
+	if err != nil {
+		t.Fatalf("parsing minimal tx: %v", err)
+	}
+	wantTxID := parsed.TxID().String()
+
+	ms := &mockStore{}
+	pub := &recordingCallbackPub{}
+	val := validator.NewValidator(nil, nil)
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		publisher:      pub,
+		validator:      val,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	const callbackToken = "client-cb-token"
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-CallbackToken", callbackToken)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Persistence: persistRejectedAtIntake's GetOrInsertStatus stub
+	// returns (nil, false, nil), so the code falls through to
+	// UpdateStatus — captured here.
+	ms.mu.Lock()
+	calls := append([]*models.TransactionStatus(nil), ms.updateStatusCalls...)
+	ms.mu.Unlock()
+	var sawReject bool
+	for _, c := range calls {
+		if c.TxID == wantTxID && c.Status == models.StatusRejected {
+			sawReject = true
+			break
+		}
+	}
+	if !sawReject {
+		t.Errorf("expected a REJECTED row for txid %s; UpdateStatus calls=%v", wantTxID, calls)
+	}
+
+	// Submission queue: drain into the store so we can assert that
+	// recordSubmission queued a row with the right txid + token.
+	drainSubmissions(t, srv)
+	ms.mu.Lock()
+	subs := append([]*models.Submission(nil), ms.insertedSubmissions...)
+	ms.mu.Unlock()
+	if len(subs) != 1 {
+		t.Fatalf("expected exactly 1 InsertSubmission for intake-rejected tx with callback token, got %d", len(subs))
+	}
+	if subs[0].TxID != wantTxID {
+		t.Errorf("submission TxID = %q, want %q", subs[0].TxID, wantTxID)
+	}
+	if subs[0].CallbackToken != callbackToken {
+		t.Errorf("submission CallbackToken = %q, want %q", subs[0].CallbackToken, callbackToken)
+	}
+
+	// Publish: REJECTED event must go to events.Publisher so SSE / live
+	// subscribers see the terminal outcome.
+	pub.mu.Lock()
+	publishes := append([]*models.TransactionStatus(nil), pub.publishes...)
+	pub.mu.Unlock()
+	if len(publishes) != 1 {
+		t.Fatalf("expected exactly 1 Publish call, got %d", len(publishes))
+	}
+	if publishes[0].TxID != wantTxID {
+		t.Errorf("publish TxID = %q, want %q", publishes[0].TxID, wantTxID)
+	}
+	if publishes[0].Status != models.StatusRejected {
+		t.Errorf("publish Status = %q, want %q", publishes[0].Status, models.StatusRejected)
+	}
+	if publishes[0].ExtraInfo == "" {
+		t.Errorf("publish ExtraInfo is empty; expected the validator reason to be carried for subscriber context")
+	}
+}
+
+// TestHandleSubmitTransaction_ValidationFailure_NoCallback_StillPublishes
+// guards the "publish symmetrically with the success path" choice: even
+// when the request had no callback URL or token, the REJECTED event is
+// still broadcast so a token-less SSE listener or future bulk
+// subscriber can observe the rejection. Without this assertion, a
+// later refactor could quietly gate the publish on hasSubscription()
+// and silently break observers on the broader channel.
+func TestHandleSubmitTransaction_ValidationFailure_NoCallback_StillPublishes(t *testing.T) {
+	rawTx := makeMinimalTx()
+
+	ms := &mockStore{}
+	pub := &recordingCallbackPub{}
+	val := validator.NewValidator(nil, nil)
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		publisher:      pub,
+		validator:      val,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	// Intentionally no X-CallbackUrl / X-CallbackToken — opts.hasSubscription() == false.
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// recordSubmission no-ops without a subscription — confirm that
+	// stays true so we don't silently start inserting empty rows.
+	drainSubmissions(t, srv)
+	ms.mu.Lock()
+	subs := len(ms.insertedSubmissions)
+	ms.mu.Unlock()
+	if subs != 0 {
+		t.Errorf("expected 0 InsertSubmission calls with no callback opts, got %d", subs)
+	}
+
+	// Publish still fires — this is the symmetry guard.
+	pub.mu.Lock()
+	publishes := len(pub.publishes)
+	pub.mu.Unlock()
+	if publishes != 1 {
+		t.Errorf("expected 1 Publish call even without callback opts, got %d — REJECTED must broadcast for token-less / bulk subscribers", publishes)
+	}
+}
+
+// TestHandleSubmitTransaction_ValidationFailure_NilPublisher_NoPanic
+// guards struct-literal test setups (which leave publisher unset) from
+// regressing into a nil dereference inside rejectAtIntake.
+func TestHandleSubmitTransaction_ValidationFailure_NilPublisher_NoPanic(t *testing.T) {
+	rawTx := makeMinimalTx()
+	ms := &mockStore{}
+	val := validator.NewValidator(nil, nil)
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(&kafka.RecordingBroker{}),
+		store:          ms,
+		publisher:      nil, // explicit
+		validator:      val,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/tx", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-CallbackToken", "tok")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req) // must not panic
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleSubmitTransactions_ValidationFailure_RecordsSubmissionAndPublishes
+// is the batch-path mirror of the single-submit intake-rejection test.
+// First (and only) tx in the batch fails validation; the helper must
+// fire for that txid even though the batch is aborted before the dedup
+// loop ever runs.
+func TestHandleSubmitTransactions_ValidationFailure_RecordsSubmissionAndPublishes(t *testing.T) {
+	rawTx := makeMinimalTx()
+	parsed, _, err := sdkTx.NewTransactionFromStream(rawTx)
+	if err != nil {
+		t.Fatalf("parsing minimal tx: %v", err)
+	}
+	wantTxID := parsed.TxID().String()
+
+	ms := &mockStore{}
+	pub := &recordingCallbackPub{}
+	val := validator.NewValidator(nil, nil)
+	broker := &kafka.RecordingBroker{}
+	gin.SetMode(gin.TestMode)
+	srv := &Server{
+		cfg:            &config.Config{CallbackToken: testCallbackToken},
+		logger:         zap.NewNop(),
+		producer:       kafka.NewProducer(broker),
+		store:          ms,
+		publisher:      pub,
+		validator:      val,
+		submissionCh:   make(chan submissionRecord, submissionRecorderBuffer),
+		submissionStop: make(chan struct{}),
+	}
+	router := gin.New()
+	srv.registerRoutes(router)
+
+	const callbackToken = "client-cb-token"
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/txs", bytes.NewReader(rawTx))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-CallbackToken", callbackToken)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	drainSubmissions(t, srv)
+
+	// REJECTED row written for the failing tx.
+	ms.mu.Lock()
+	calls := append([]*models.TransactionStatus(nil), ms.updateStatusCalls...)
+	subs := append([]*models.Submission(nil), ms.insertedSubmissions...)
+	ms.mu.Unlock()
+	var sawReject bool
+	for _, c := range calls {
+		if c.TxID == wantTxID && c.Status == models.StatusRejected {
+			sawReject = true
+			break
+		}
+	}
+	if !sawReject {
+		t.Errorf("expected REJECTED row for batch txid %s; UpdateStatus calls=%v", wantTxID, calls)
+	}
+
+	if len(subs) != 1 || subs[0].TxID != wantTxID || subs[0].CallbackToken != callbackToken {
+		t.Errorf("expected 1 InsertSubmission for batch txid %s with token %q; got %d: %+v", wantTxID, callbackToken, len(subs), subs)
+	}
+
+	pub.mu.Lock()
+	publishes := append([]*models.TransactionStatus(nil), pub.publishes...)
+	pub.mu.Unlock()
+	if len(publishes) != 1 || publishes[0].TxID != wantTxID || publishes[0].Status != models.StatusRejected {
+		t.Errorf("expected 1 REJECTED publish for batch txid %s; got %d: %+v", wantTxID, len(publishes), publishes)
+	}
+
+	// The batch must abort before publishing anything to TopicPropagation.
+	if got := totalMessages(broker); got != 0 {
+		t.Errorf("validation failure must abort the batch with no Kafka publish; got %d messages", got)
 	}
 }
 
@@ -1215,7 +1655,7 @@ func TestHandleSubmitTransactions_TxID_IsCanonical(t *testing.T) {
 	router.ServeHTTP(w, req)
 	drainSubmissions(t, srv)
 
-	if w.Code != http.StatusOK {
+	if w.Code != http.StatusAccepted {
 		t.Fatalf("status %d: %s", w.Code, w.Body.String())
 	}
 

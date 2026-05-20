@@ -18,11 +18,10 @@
 //
 // Service ownership
 //
-//   - tx_validator: pipeline depth, flush latency/size, parse fails, accept
-//     vs reject vs duplicate counts.
 //   - propagation: batch size, broadcast latency per outcome, chunk count,
-//     pending-retry depth, reaper lease and tick outcomes, inline retries,
-//     merkle registration latency.
+//     dispatcher pending depth, deferred-requeue gauge, reaper lease and
+//     tick outcomes, narrowed-reaper rebroadcast depth, merkle registration
+//     latency.
 //   - bump_builder: build duration, blocks processed, BUMP outcomes, STUMP
 //     and grace-window stats.
 //   - api_server: request latency by route + status, in-flight gauge.
@@ -63,49 +62,6 @@ var bytesBuckets = []float64{
 }
 
 // ---------------------------------------------------------------------------
-// tx_validator
-// ---------------------------------------------------------------------------
-
-// TxValidatorPendingDepth is the size of the pending-validation slice. Sustained
-// growth means handleMessage is queueing faster than flushValidations can
-// process — likely time to increase tx_validator.parallelism or partition count.
-var TxValidatorPendingDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_tx_validator_pending_depth",
-	Help: "Number of raw tx messages buffered awaiting flush.",
-})
-
-// TxValidatorPublishCarryDepth is the size of the publish-carry slice. Non-zero
-// means the propagation Kafka topic is rejecting publishes — investigate Kafka
-// health.
-var TxValidatorPublishCarryDepth = promauto.NewGauge(prometheus.GaugeOpts{
-	Name: "arcade_tx_validator_publish_carry_depth",
-	Help: "Number of validated propagation messages awaiting Kafka publish retry.",
-})
-
-// TxValidatorFlushDuration measures end-to-end wall time of one flush window
-// (parse + dedup + validate + persist + publish).
-var TxValidatorFlushDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-	Name:    "arcade_tx_validator_flush_duration_seconds",
-	Help:    "Wall time of one tx_validator flush window, by outcome.",
-	Buckets: latencyBuckets,
-}, []string{labelOutcome}) // success, publish_failed
-
-// TxValidatorFlushSize captures how many txs each flush processed. Tracking the
-// distribution surfaces whether parallelism is being applied at all (a stuck
-// at size=1 means we're effectively serial).
-var TxValidatorFlushSize = promauto.NewHistogram(prometheus.HistogramOpts{
-	Name:    "arcade_tx_validator_flush_size",
-	Help:    "Number of txs processed per flush window.",
-	Buckets: sizeBuckets,
-})
-
-// TxValidatorOutcomeTotal counts per-tx outcomes from the validation phase.
-var TxValidatorOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_tx_validator_outcome_total",
-	Help: "Per-tx validation outcome counts.",
-}, []string{labelOutcome}) // accepted, rejected, duplicate, parse_fail, store_error
-
-// ---------------------------------------------------------------------------
 // propagation
 // ---------------------------------------------------------------------------
 
@@ -129,15 +85,28 @@ var PropagationBroadcastConsensus = promauto.NewCounterVec(prometheus.CounterOpt
 	Help: "Per-broadcast consensus outcome across all responding endpoints.",
 }, []string{"verdict"}) // accepted, unanimous_reject, mixed, unreachable
 
-// PropagationPendingDepth gauges how many propagationMsgs are buffered in
-// the propagator's accumulator slice between flushes. Sustained growth
-// indicates downstream (teranode broadcast or merkle-service register) is
-// not keeping up with ingest — combined with the publish-carry gauge on the
-// validator side, this is the canonical "kafka consumer falling behind"
-// signal.
+// PropagationPendingDepth gauges how many propagationMsgs the dep-aware
+// dispatcher is currently holding in its pendingMsgs accumulator awaiting
+// the next flush. The dispatcher owns the slice on a single goroutine,
+// so the gauge tracks its length at every mutation point. Sustained
+// growth indicates downstream (teranode broadcast or merkle-service
+// register) is not keeping up with ingest.
 var PropagationPendingDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "arcade_propagation_pending_depth",
-	Help: "Number of propagation messages buffered awaiting flush.",
+	Help: "Number of propagation messages buffered in the dispatcher awaiting flush.",
+})
+
+// PropagationPendingRequeues gauges how many delayed-requeue goroutines
+// are currently parked waiting for their flat requeueDelay to elapse
+// before pushing back onto the dispatcher. Each Teranode infra-failure
+// (no peer reachable, parseable 500, per-slot PROCESSING) drives a
+// new requeue, so a sustained high value points to upstream pressure
+// — pair it with TeranodeEndpointHealth to confirm. Inc'd on entry,
+// Dec'd via defer regardless of whether the goroutine exits via timer
+// or ctx.Done.
+var PropagationPendingRequeues = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "arcade_propagation_pending_requeues",
+	Help: "Number of requeueAfterDelay goroutines currently awaiting their delay before re-admitting messages.",
 })
 
 // PropagationInflightBatches gauges how many flushBatch goroutines are
@@ -170,15 +139,7 @@ var PropagationOutcomeTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 var PropagationChunkTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "arcade_propagation_chunk_total",
 	Help: "Number of chunk broadcasts issued, by fallback decision.",
-}, []string{"fallback"}) // none, per_tx_after_all_rejected
-
-// PropagationInlineRetryTotal counts inline retry attempts (Fix #7) — how
-// often a transient broadcast failure was caught at the validator step before
-// going to durable PENDING_RETRY.
-var PropagationInlineRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "arcade_propagation_inline_retry_total",
-	Help: "Inline retry attempts on broadcastSingleToEndpoints.",
-}, []string{labelOutcome}) // recovered, exhausted
+}, []string{"fallback"}) // none
 
 // PropagationMerkleRegisterDuration measures the merkle-service registration
 // wall time for one flushBatch — a single bounded-concurrency fan-out over
@@ -226,12 +187,16 @@ var PropagationReaperTickTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Reaper tick outcomes.",
 }, []string{labelOutcome}) // ran, skipped_no_leader, lease_error
 
-// PropagationReaperReadyDepth is the count of PENDING_RETRY rows that the last
-// reaper tick observed as ready. Sustained high values indicate a struggling
-// downstream (datahubs flapping, merkle slow).
+// PropagationReaperReadyDepth is the count of stale SEEN_ON_NETWORK /
+// SEEN_MULTIPLE_NODES rows the last reaper tick observed as candidates
+// for rebroadcast. Set on every tick (including to 0 when the queue
+// clears) so dashboards reflect current state, not the last non-zero
+// scan. Sustained high values indicate a struggling downstream
+// (datahubs flapping, merkle slow) blocking SEEN_ON_NETWORK txs from
+// reaching ACCEPTED.
 var PropagationReaperReadyDepth = promauto.NewGauge(prometheus.GaugeOpts{
 	Name: "arcade_propagation_reaper_ready_depth",
-	Help: "Number of PENDING_RETRY rows ready at the last reaper tick.",
+	Help: "Number of stale SEEN_ON_NETWORK rows ready for rebroadcast at the last reaper tick.",
 })
 
 // ---------------------------------------------------------------------------

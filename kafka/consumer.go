@@ -15,12 +15,19 @@ import (
 // drain-then-flush + retry + DLQ logic so services only supply a per-message
 // handler and an optional batch-flush hook. The underlying Broker supplies
 // the transport (Sarama or in-memory).
+//
+// When ClaimHandler is set on the ConsumerConfig, the wrapper hands the
+// raw Claim to that function and lets it own the per-partition loop
+// end-to-end. The drain/flush/retry/DLQ logic is bypassed entirely —
+// useful for stateful services that need to own the goroutine their
+// state lives on (e.g. the dep-aware propagator).
 type ConsumerGroup struct {
 	broker        Broker
 	sub           Subscription
 	topics        []string
 	handler       MessageHandler
 	flushFunc     FlushFunc
+	claimHandler  ClaimHandler
 	producer      *Producer
 	maxRetries    int
 	flushInterval time.Duration
@@ -33,6 +40,14 @@ type ConsumerGroup struct {
 // rebalance) the context is already canceled, so downstream work (broadcasts,
 // store writes) can abort cleanly instead of running on Background.
 type FlushFunc func(ctx context.Context) error
+
+// ClaimHandler is invoked once per Sarama claim when set on a
+// ConsumerConfig. The handler owns the entire per-partition loop: pull
+// messages from claim.Messages(), watch claim.Context() for cancellation,
+// and call claim.MarkMessage when ready to commit an offset. When the
+// handler returns, the claim ends. Used by services that need to keep
+// dispatcher state in the same goroutine that consumes from Kafka.
+type ClaimHandler func(claim Claim) error
 
 type ConsumerConfig struct {
 	Broker     Broker
@@ -49,11 +64,25 @@ type ConsumerConfig struct {
 	// Default 50ms via NewConsumerGroup; zero disables the ticker.
 	FlushInterval time.Duration
 	Logger        *zap.Logger
+	// ClaimHandler, when set, takes precedence over Handler / FlushFunc.
+	// The wrapper hands every Claim directly to this function — no
+	// internal drain loop, no per-message retry, no DLQ. The service
+	// owning the handler owns the goroutine running it, and can keep
+	// per-partition state in local variables without any cross-goroutine
+	// synchronization.
+	ClaimHandler ClaimHandler
 }
 
 func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 	if cfg.Broker == nil {
 		return nil, fmt.Errorf("ConsumerConfig.Broker is required")
+	}
+	// Require exactly one of (Handler, ClaimHandler). Without this guard a
+	// nil Handler in legacy mode panics inside the per-message dispatch
+	// loop the first time a message arrives — failing fast at construction
+	// turns that latent panic into a startup error operators can act on.
+	if cfg.Handler == nil && cfg.ClaimHandler == nil {
+		return nil, fmt.Errorf("ConsumerConfig: either Handler or ClaimHandler must be set")
 	}
 	sub, err := cfg.Broker.Subscribe(cfg.GroupID, cfg.Topics)
 	if err != nil {
@@ -81,6 +110,7 @@ func NewConsumerGroup(cfg ConsumerConfig) (*ConsumerGroup, error) {
 		topics:        cfg.Topics,
 		handler:       cfg.Handler,
 		flushFunc:     cfg.FlushFunc,
+		claimHandler:  cfg.ClaimHandler,
 		producer:      cfg.Producer,
 		maxRetries:    maxRetries,
 		flushInterval: flushInterval,
@@ -118,7 +148,15 @@ func (c *ConsumerGroup) Close() error {
 // keeps observing new messages — sustained traffic would otherwise defer the
 // flush indefinitely and grow the in-memory pending slice. Bounds end-to-end
 // latency without sacrificing the drain-then-flush batching efficiency.
+//
+// When a ClaimHandler is configured the wrapper bypasses the drain/flush
+// pattern entirely and hands the raw Claim to the handler — the service
+// owns the goroutine, the message-pull cadence, and the MarkMessage
+// timing in that mode.
 func (c *ConsumerGroup) handleClaim(claim Claim) error {
+	if c.claimHandler != nil {
+		return c.claimHandler(claim)
+	}
 	ctx := claim.Context()
 	defer c.flush(ctx)
 
@@ -162,6 +200,10 @@ func (c *ConsumerGroup) handleClaim(claim Claim) error {
 	}
 }
 
+// processOne runs the configured handler against a single message, then
+// marks the offset. On DLQ-publish failure the offset is left unmarked so
+// Kafka redelivers on the next session — preferable to silent message
+// loss.
 func (c *ConsumerGroup) processOne(claim Claim, msg *Message) {
 	metrics.KafkaMessagesTotal.WithLabelValues(msg.Topic, "consume").Inc()
 	metrics.KafkaMessageBytes.WithLabelValues(msg.Topic, "consume").Observe(float64(len(msg.Value)))
