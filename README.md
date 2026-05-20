@@ -128,6 +128,8 @@ go get -u github.com/bsv-blockchain/arcade
 
 ## 🚀 Quick Start
 
+> Looking for per-network setup (mainnet / testnet / teratestnet / regtest)? See [`docs/getting-started.md`](docs/getting-started.md).
+
 ### Prerequisites
 
 - **Go 1.26+** (see `go.mod` for exact version)

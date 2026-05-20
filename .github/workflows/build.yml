@@ -148,7 +148,15 @@ jobs:
             status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${WR_HEAD_SHA}" --jq '.status')
             [[ "$status" == "identical" || "$status" == "behind" ]] || { echo "head_sha not on main: $status"; exit 1; }
           elif [[ "$WR_HEAD_BRANCH" =~ ^v[0-9] ]]; then
-            tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${WR_HEAD_BRANCH}" --jq '.object.sha')
+            # Peel annotated tags: /git/refs/tags returns the tag-object SHA
+            # (type "tag") for annotated tags, not the commit. workflow_run.head_sha
+            # is always the underlying commit, so dereference one extra hop.
+            ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${WR_HEAD_BRANCH}")
+            tag_sha=$(jq -r '.object.sha' <<<"$ref")
+            tag_type=$(jq -r '.object.type' <<<"$ref")
+            if [[ "$tag_type" == "tag" ]]; then
+              tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.object.sha')
+            fi
             [[ "$tag_sha" == "$WR_HEAD_SHA" ]] || { echo "tag $WR_HEAD_BRANCH does not point at $WR_HEAD_SHA"; exit 1; }
           else
             echo "Refusing untrusted head_branch: $WR_HEAD_BRANCH"
@@ -271,7 +279,15 @@ jobs:
             status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${WR_HEAD_SHA}" --jq '.status')
             [[ "$status" == "identical" || "$status" == "behind" ]] || { echo "head_sha not on main: $status"; exit 1; }
           elif [[ "$WR_HEAD_BRANCH" =~ ^v[0-9] ]]; then
-            tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${WR_HEAD_BRANCH}" --jq '.object.sha')
+            # Peel annotated tags: /git/refs/tags returns the tag-object SHA
+            # (type "tag") for annotated tags, not the commit. workflow_run.head_sha
+            # is always the underlying commit, so dereference one extra hop.
+            ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${WR_HEAD_BRANCH}")
+            tag_sha=$(jq -r '.object.sha' <<<"$ref")
+            tag_type=$(jq -r '.object.type' <<<"$ref")
+            if [[ "$tag_type" == "tag" ]]; then
+              tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.object.sha')
+            fi
             [[ "$tag_sha" == "$WR_HEAD_SHA" ]] || { echo "tag $WR_HEAD_BRANCH does not point at $WR_HEAD_SHA"; exit 1; }
           else
             echo "Refusing untrusted head_branch: $WR_HEAD_BRANCH"
