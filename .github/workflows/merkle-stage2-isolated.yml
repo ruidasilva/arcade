@@ -77,6 +77,17 @@ jobs:
         if: always()
         run: docker compose -f compose/stage2-isolated/docker-compose.yml down -v
 
+      - name: Pre-pull pinned Merkle image
+        run: docker pull ghcr.io/bsv-blockchain/merkle-service@sha256:8393a456cac5f5bf24537b519d82a4d96fded0b43005fa0412a7545e43ecf168
+
+      - name: Run isolated lifecycle qualification
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+          STAGE2_EVIDENCE: dist/provenance/stage2-lifecycle.json
+        run: |
+          set -euo pipefail
+          go test -tags=e2e -count=1 -timeout=20m -v -run TestStage2_IsolatedLifecycle ./tests/e2e/ | tee dist/provenance/stage2-lifecycle.txt
+
       - name: Upload qualification artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -87,6 +98,8 @@ jobs:
             dist/provenance/release-manifest.json
             dist/provenance/verification.txt
             dist/provenance/stage2-probe.txt
+            dist/provenance/stage2-lifecycle.json
+            dist/provenance/stage2-lifecycle.txt
             dist/provenance/stage2-compose.log
           if-no-files-found: warn
           retention-days: 14

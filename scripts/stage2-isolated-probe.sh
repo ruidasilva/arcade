@@ -86,6 +86,12 @@ if grep -F -q -- "synthetic-stage2-merkle-auth-bearer" <<<"$logs"; then
 fi
 echo "SECRET_IN_LOGS=absent"
 
+if grep -E -q 'bsvb\.tech|dnsaddr/' <<<"$logs"; then
+  echo "external bootstrap hostname appeared in container logs" >&2
+  exit 1
+fi
+echo "EXTERNAL_BOOTSTRAP_CONNECTIONS=0"
+
 "${compose[@]}" restart votari-arcade votari-stage2-merkle >/dev/null
 restart_health=$(wait_http "http://votari-arcade:8080/health" "200")
 restart_correct=$(post_callback "$token")

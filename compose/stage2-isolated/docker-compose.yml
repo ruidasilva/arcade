@@ -68,12 +68,13 @@ services:
       timeout: 3s
       retries: 12
 
-  # Pinned to the digest the Arcade e2e harness already uses
-  # (merkle-service v0.2.5). That release predates the
-  # expectedSubtreeIndices producer contract. This stack does not
-  # float :latest.
+  # merkle-service v0.4.5, linux/amd64 manifest digest. This is the
+  # minimum release that emits expectedSubtreeIndices. The tag is not
+  # used as the pin. v0.2.5 did not have that producer contract.
+  # Private-IP callback support stays an explicit env setting; the
+  # image default is still off.
   votari-stage2-merkle:
-    image: ghcr.io/bsv-blockchain/merkle-service@sha256:ff4ae409df2680c54267c27887dc1744fb3b64e5ddc5636882185ce82b35ced3
+    image: ghcr.io/bsv-blockchain/merkle-service@sha256:8393a456cac5f5bf24537b519d82a4d96fded0b43005fa0412a7545e43ecf168
     environment:
       MODE: all-in-one
       LOG_LEVEL: info
