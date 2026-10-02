@@ -138,11 +138,14 @@ including `latest`, moves and is not a provenance identity.
 Generic Arcade owns source revision, dirty-tree detection, OCI labels, Go
 buildinfo, SBOM generation, and the local release manifest.
 
-It does not own registry location, image names used by a specific
-deployment, secret storage, host rollout, release approval, or the record
-that a production environment is pinned to a digest. Those belong with the
-deployment system that pulls the image. Signing and attestation are not
-implemented here; they stay with that same publishing foundation.
+Votari infrastructure owns the rest of release governance: the registry and
+image name used in production, secret storage, host rollout, release
+approval, pinning a running deployment to a digest, and where that
+deployment's release manifest is stored. None of that is configured in this
+repository.
+
+Signing and attestation are not implemented here. They stay with the
+publishing foundation that holds the signing keys.
 
 ## Verification
 
