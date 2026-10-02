@@ -38,7 +38,7 @@ mkdir -p "$dest"
 archive="$dest/$name"
 
 curl -fsSL "$url" -o "$archive"
-echo "${sum}  ${archive}" | sha256sum -c -
+echo "${sum}  ${archive}" | sha256sum -c --status -
 
 tar -xzf "$archive" -C "$dest" syft
 chmod +x "$dest/syft"
