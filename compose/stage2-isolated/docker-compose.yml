@@ -87,7 +87,7 @@ services:
       P2P_ENABLE_MDNS: "false"
       CALLBACK_ALLOW_PRIVATE_IPS: "true"
       DATAHUB_ALLOW_PRIVATE_IPS: "true"
-      BLOB_STORE_URL: memory:
+      BLOB_STORE_URL: "memory:"
     networks:
       - stage2
     depends_on:
