@@ -48,6 +48,24 @@ local image reference is `arcade:provenance`. `local_image_id` is the local
 image ID. It is not a registry manifest digest. The registry digest for this
 qualification is none.
 
+Observed on the isolated qualification run
+`36978016885` (2026-10-02):
+
+```text
+SOURCE_SHA=e6aab82f0f3c1cd7cf3f9985e9e06ee39fb5e162
+OCI_REVISION=e6aab82f0f3c1cd7cf3f9985e9e06ee39fb5e162
+OCI_SOURCE=https://github.com/ruidasilva/arcade
+OCI_CREATED=2026-10-02T07:20:54Z
+OCI_VERSION=stage2-isolated-qualification
+GO_VCS_REVISION=e6aab82f0f3c1cd7cf3f9985e9e06ee39fb5e162
+GO_VCS_MODIFIED=false
+LOCAL_IMAGE_ID=sha256:9d4a19aa005c239c6af0c171e0bb76dceb13f0525086e4d283bd95f2e571ae1c
+REGISTRY_MANIFEST_DIGEST=none
+SBOM=sbom.spdx.json SPDX-2.3 name=arcade packages=305
+SBOM_SHA256=27eca7d0df554d3fb949b582e50a3b21e1d3c6a8c4a9d733d22bc822cef394ae
+RELEASE_MANIFEST=release-manifest.json source_clean=true
+```
+
 The Merkle container is the digest already pinned by the Arcade end-to-end
 harness:
 
@@ -58,9 +76,6 @@ ghcr.io/bsv-blockchain/merkle-service@sha256:ff4ae409df2680c54267c27887dc1744fb3
 That digest is merkle-service v0.2.5. It does not implement the
 `expectedSubtreeIndices` producer contract, which requires merkle-service
 v0.4.5 or newer.
-
-Runtime provenance values are filled from the qualification workflow after
-the image build. They are not invented here.
 
 ## Synthetic secrets
 
@@ -77,19 +92,34 @@ isolated Compose config. They are not production secrets.
 
 ## What this environment can prove
 
-The probe joins the private network and records:
+The probe joins the private network. Run `36978016885` recorded:
 
-- the callback port is not published on the host;
-- the Merkle port is not published on the host;
-- a callback with no bearer is rejected;
-- a callback with the wrong bearer is rejected;
-- a callback with the configured bearer is accepted;
-- neither bearer appears in Arcade or Merkle logs;
-- after Arcade and Merkle restart, the configured bearer is still accepted.
+```text
+PRIVATE_CALLBACK_HOST_PORT=unpublished
+MERKLE_HOST_PORT=unpublished
+ARCADE_HEALTH=200
+MERKLE_HEALTH=200
+CALLBACK_MISSING_BEARER=401
+CALLBACK_WRONG_BEARER=401
+CALLBACK_CORRECT_BEARER=200
+SECRET_IN_LOGS=absent
+RESTART_HEALTH=200
+RESTART_CORRECT_BEARER=200
+```
 
-The accepted call uses an unknown synthetic txid. Arcade acknowledges an
-unknown SEEN callback without creating a row. That proves authentication. It
-does not prove a lifecycle transition.
+Arcade logged `starting arcade` with `mode=all`, `kafka_backend=sarama`,
+and `store_backend=pebble`, then listened on `0.0.0.0:8080` inside the
+network. Both accepted callbacks were `SEEN_ON_NETWORK` for one unknown
+synthetic txid. Arcade logged `dropping callback for unknown txid` and did
+not create a lifecycle row. The same drop was logged again after restart.
+No `MINED` line was logged.
+
+Restart replayed the Pebble WAL (`replayed 10 keys`). Those keys are the
+embedded chaintracks store, not a tracked transaction. No transaction was
+pending, so this restart does not prove retention of a tracked row.
+
+The accepted call proves authentication. It does not prove a lifecycle
+transition.
 
 ## What this environment cannot prove
 
@@ -98,6 +128,13 @@ DataHub in this stack, so Arcade cannot move a transaction through broadcast
 and mining. The pinned Merkle image cannot emit `expectedSubtreeIndices`.
 There is no fault hook that fails a Pebble write on the first SEEN callback
 or fails `SetMinedByTxIDs` once.
+
+`--mode all` also starts embedded chaintracks. With `network: teratestnet`
+that process dialed the built-in teratestnet bootstrap peers and logged that
+those peers connected. `p2p.datahub_discovery` was off. That dial is not the
+production host and it is not a production change. A later isolated run that
+must stay off public peers needs an explicit empty bootstrap, which this
+qualification did not add.
 
 Observed lifecycle states: none.
 
