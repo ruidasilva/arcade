@@ -110,26 +110,6 @@ func TestStage2_IsolatedLifecycle(t *testing.T) {
 		}
 	}
 
-	st, ok, err := harness.GetTxStatus(ctx, rt, txid)
-	if err != nil || !ok {
-		t.Fatalf("status before restart: ok=%v err=%v", ok, err)
-	}
-	if st.TxStatus != "ACCEPTED_BY_NETWORK" && st.TxStatus != "SENT_TO_NETWORK" && st.TxStatus != "SEEN_ON_NETWORK" {
-		t.Fatalf("status before restart = %s", st.TxStatus)
-	}
-	rt.Restart(t)
-	proxy.setTarget(rt.BaseURL)
-	st, ok, err = harness.GetTxStatus(ctx, rt, txid)
-	if err != nil || !ok {
-		t.Fatalf("status after restart: ok=%v err=%v", ok, err)
-	}
-	if st.TxStatus == "" {
-		t.Fatal("tracked transaction missing after restart")
-	}
-	if err := harness.WaitForMerkleRegistration(ctx, h.Containers.MerkleHostURL, txid, 15*time.Second); err != nil {
-		t.Fatalf("watch missing after arcade restart: %v", err)
-	}
-
 	proxy.holdSTUMP.Store(true)
 	blk := publishSynthetic(t, ctx, h, rt, msDatahub, arcadeDatahub, txids, harness.RegtestGenesisHash(), 1)
 	blockProcessed := proxy.waitType(ctx, "BLOCK_PROCESSED")
@@ -146,6 +126,29 @@ func TestStage2_IsolatedLifecycle(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	if processedAt(t, ctx, rt, blk.Hash.String()) != "" {
 		t.Fatal("processedAt was set while the required STUMP was withheld")
+	}
+
+	st, ok, err := harness.GetTxStatus(ctx, rt, txid)
+	if err != nil || !ok {
+		t.Fatalf("status before restart: ok=%v err=%v", ok, err)
+	}
+	if st.TxStatus == "MINED" || st.TxStatus == "IMMUTABLE" {
+		t.Fatalf("status before restart = %s", st.TxStatus)
+	}
+	rt.Restart(t)
+	proxy.setTarget(rt.BaseURL)
+	st, ok, err = harness.GetTxStatus(ctx, rt, txid)
+	if err != nil || !ok {
+		t.Fatalf("status after restart: ok=%v err=%v", ok, err)
+	}
+	if st.TxStatus == "" || st.TxStatus == "MINED" {
+		t.Fatalf("status after restart = %s", st.TxStatus)
+	}
+	if err := harness.WaitForMerkleRegistration(ctx, h.Containers.MerkleHostURL, txid, 15*time.Second); err != nil {
+		t.Fatalf("watch missing after arcade restart: %v", err)
+	}
+	if processedAt(t, ctx, rt, blk.Hash.String()) != "" {
+		t.Fatal("restart stamped processedAt without the withheld STUMP")
 	}
 
 	proxy.holdSTUMP.Store(false)
@@ -175,19 +178,26 @@ func TestStage2_IsolatedLifecycle(t *testing.T) {
 	}
 	empty.Stage(msDatahub)
 	empty.Stage(arcadeDatahub)
-	if err := harness.PublishBlockUntilTip(ctx, rt, h.LibP2P, empty.BlockMessage(msDatahub.HostURL()), 90*time.Second); err != nil {
-		t.Fatalf("empty block tip: %v", err)
+	emptyMsg := empty.BlockMessage(msDatahub.HostURL())
+	deadline := time.Now().Add(45 * time.Second)
+	var emptyProcessed []byte
+	for emptyProcessed == nil && time.Now().Before(deadline) {
+		if err := h.LibP2P.PublishBlock(ctx, emptyMsg); err != nil {
+			t.Fatalf("publish empty block: %v", err)
+		}
+		wait, cancelWait := context.WithTimeout(ctx, 2*time.Second)
+		emptyProcessed = proxy.waitBlock(wait, empty.Hash.String())
+		cancelWait()
 	}
-	emptyProcessed := proxy.waitBlock(ctx, empty.Hash.String())
 	if emptyProcessed == nil {
 		t.Fatal("empty block BLOCK_PROCESSED was not observed")
 	}
 	if _, present := expectedIndices(emptyProcessed); present {
 		t.Fatalf("empty block carried expectedSubtreeIndices: %s", emptyProcessed)
 	}
-	deadline := time.Now().Add(20 * time.Second)
+	finalizeBy := time.Now().Add(20 * time.Second)
 	var emptyProcessedAt string
-	for time.Now().Before(deadline) {
+	for time.Now().Before(finalizeBy) {
 		emptyProcessedAt = processedAt(t, ctx, rt, empty.Hash.String())
 		if emptyProcessedAt != "" {
 			break
