@@ -118,20 +118,32 @@ That artifact is build evidence, not a deployment record.
 
 ## Immutable digest
 
-The identity of a provenance-qualified image is its digest, not a tag.
-`make provenance-build` records `docker image inspect --format '{{.Id}}'` in
-the release manifest. The publishing workflow already pushes each
-architecture by digest, then attaches the commit tag and the deployment tag.
-The commit tag and the digest are the evidence. The deployment tag,
-including `latest`, moves and is not a provenance identity.
+The identity recorded by a provenance-qualified local build is the daemon
+image ID, not a mutable tag and not a registry manifest digest.
+`make provenance-build` stores `docker image inspect --format '{{.Id}}'` as
+`local_image_id`. `registry_manifest_digest` stays null because this build
+does not push. The image-publishing workflow is separate: it pushes each
+architecture by digest, then also attaches a commit tag and a deployment
+tag. That deployment tag, including `latest`, moves and is not provenance
+evidence. A registry manifest digest remains a deployment-system gate.
 
-`dist/provenance/release-manifest.json` links:
+`dist/provenance/release-manifest.json` links the clean commit to the local
+image. `local_image_id` is `docker image inspect` image ID (`sha256:…`).
+`registry_manifest_digest` is null until an image is pushed; the local ID is
+not that digest. The manifest also records:
 
-- `revision` — full git commit
-- `source` — https repository URL
-- `digest` — image digest
-- `sbom` — path of the SPDX document
-- `vcsModified` — must be false
+- `source_repository`, `source_revision`, `source_clean`
+- `oci_revision`, `oci_source`, `oci_created`, `oci_version`
+- `go_vcs_revision`, `go_vcs_modified`
+- `application_version`
+- `image_reference` (`arcade:provenance`)
+- `sbom` filename and `sbom_sha256`
+- `build_timestamp`
+
+`.github/workflows/provenance-qualification.yml` runs this path on a Linux
+runner: clean checkout, fail-closed rejection of a bad revision and a dirty
+tree, local image build, verification, and upload of the SBOM, manifest, and
+verification log. It does not log in to a registry and does not push.
 
 ## Generic Arcade and deployment governance
 

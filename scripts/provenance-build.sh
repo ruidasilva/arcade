@@ -11,46 +11,17 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
+# shellcheck source=provenance-preflight.sh
+source "$root/scripts/provenance-preflight.sh"
 
 if [[ "$(go env GOOS)" != "linux" ]]; then
   echo "provenance-build requires a Linux host: CGO + gobdk cannot cross-compile a linux binary from $(go env GOOS)." >&2
   exit 1
 fi
 
-rev=$(git rev-parse --verify HEAD)
-if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "refusing provenance build: revision ${rev} is not a full commit SHA" >&2
-  exit 1
-fi
-
-dirty=$(git status --porcelain)
-if [[ -n "$dirty" ]]; then
-  echo "refusing provenance build: working tree is dirty" >&2
-  printf '%s\n' "$dirty" >&2
-  exit 1
-fi
-
-if [[ -n "${ARCADE_EXPECTED_REVISION:-}" && "$ARCADE_EXPECTED_REVISION" != "$rev" ]]; then
-  echo "refusing provenance build: HEAD ${rev} does not match ARCADE_EXPECTED_REVISION ${ARCADE_EXPECTED_REVISION}" >&2
-  exit 1
-fi
-
-source_url=${ARCADE_IMAGE_SOURCE:-}
-if [[ -z "$source_url" ]]; then
-  remote=$(git remote get-url origin 2>/dev/null || true)
-  remote=${remote%.git}
-  if [[ "$remote" =~ ^git@([^:]+):(.+)$ ]]; then
-    source_url="https://${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-  elif [[ "$remote" =~ ^ssh://git@([^/]+)/(.+)$ ]]; then
-    source_url="https://${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
-  elif [[ "$remote" =~ ^https:// ]]; then
-    source_url=$remote
-  fi
-fi
-if [[ ! "$source_url" =~ ^https://[^[:space:]]+$ ]]; then
-  echo "refusing provenance build: set ARCADE_IMAGE_SOURCE to the https source repository URL" >&2
-  exit 1
-fi
+provenance_preflight
+rev=$PROVENANCE_REVISION
+source_url=$PROVENANCE_SOURCE
 
 version=${ARCADE_VERSION:-$(git describe --tags --always)}
 if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
@@ -92,7 +63,7 @@ source_label=$(docker image inspect --format '{{index .Config.Labels "org.openco
 revision_label=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' arcade:provenance)
 created_label=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.created"}}' arcade:provenance)
 version_label=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' arcade:provenance)
-if [[ "$source_label" != "$source_url" || "$revision_label" != "$rev" || "$created_label" != "$created" || -z "$version_label" ]]; then
+if [[ "$source_label" != "$source_url" || "$revision_label" != "$rev" || "$created_label" != "$created" || "$version_label" != "$version" ]]; then
   echo "refusing provenance build: image labels do not match the source stamp" >&2
   printf 'source=%q revision=%q created=%q version=%q\n' "$source_label" "$revision_label" "$created_label" "$version_label" >&2
   exit 1
@@ -100,19 +71,32 @@ fi
 
 syft=$(bash scripts/install-syft.sh)
 "$syft" arcade:provenance -o spdx-json=dist/provenance/sbom.spdx.json
+sbom_hash=$(sha256sum dist/provenance/sbom.spdx.json | awk '{print $1}')
+if [[ ! "$sbom_hash" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "refusing provenance build: SBOM hash is missing" >&2
+  exit 1
+fi
 
-python3 - "$rev" "$source_url" "$version" "$created" "$digest" <<'PY'
+python3 - "$rev" "$source_url" "$version" "$created" "$digest" "$embedded_rev" "$sbom_hash" <<'PY'
 import json, sys
-rev, source, version, created, digest = sys.argv[1:]
+rev, source, version, created, local_id, go_rev, sbom_hash = sys.argv[1:]
 doc = {
-    "revision": rev,
-    "source": source,
-    "version": version,
-    "created": created,
-    "image": "arcade:provenance",
-    "digest": digest,
-    "sbom": "dist/provenance/sbom.spdx.json",
-    "vcsModified": False,
+    "source_repository": source,
+    "source_revision": rev,
+    "source_clean": True,
+    "oci_source": source,
+    "oci_revision": rev,
+    "oci_created": created,
+    "oci_version": version,
+    "go_vcs_revision": go_rev,
+    "go_vcs_modified": False,
+    "application_version": version,
+    "image_reference": "arcade:provenance",
+    "local_image_id": local_id,
+    "registry_manifest_digest": None,
+    "sbom": "sbom.spdx.json",
+    "sbom_sha256": sbom_hash,
+    "build_timestamp": created,
 }
 with open("dist/provenance/release-manifest.json", "w", encoding="utf-8") as fh:
     json.dump(doc, fh, indent=2)
@@ -121,6 +105,7 @@ PY
 
 echo "provenance image arcade:provenance"
 echo "revision ${rev}"
-echo "digest ${digest}"
+echo "local_image_id ${digest}"
+echo "registry_manifest_digest none"
 echo "manifest dist/provenance/release-manifest.json"
 echo "sbom dist/provenance/sbom.spdx.json"

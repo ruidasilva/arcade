@@ -1,4 +1,4 @@
-.PHONY: build test lint docker-up docker-down docker-build provenance-build provenance-verify run
+.PHONY: build test lint docker-up docker-down docker-build provenance-build provenance-verify provenance-negative run
 
 GOARCH ?= $(shell go env GOARCH)
 
@@ -51,6 +51,11 @@ provenance-build:
 IMAGE ?= arcade:provenance
 provenance-verify:
 	bash scripts/verify-image-provenance.sh "$(IMAGE)"
+
+# Reject a mismatched revision, a non-SHA revision, and a dirty tree.
+# Restores the worktree. Requires a clean checkout.
+provenance-negative:
+	bash scripts/provenance-negative.sh
 
 run:
 	go run ./cmd/arcade
