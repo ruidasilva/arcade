@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -622,6 +623,9 @@ func writeEvidence(t *testing.T, evidence map[string]any) {
 	}
 	raw, err := json.MarshalIndent(evidence, "", "  ")
 	if err != nil {
+		t.Fatalf("evidence: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("evidence: %v", err)
 	}
 	if err := os.WriteFile(path, append(raw, '\n'), 0o644); err != nil {
