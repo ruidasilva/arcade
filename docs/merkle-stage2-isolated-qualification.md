@@ -4,6 +4,9 @@ This note records an isolated qualification of the Stage-2 topology. It does
 not enable Merkle in production, does not change the production host, and
 does not authorise a later gate.
 
+The first blocked run is kept below, unchanged. A later lifecycle run is
+recorded in [Lifecycle run](#lifecycle-run).
+
 The governing design is the Votari Stage-2 architecture and execution plan
 dated 2026-10-01. This stack follows that design:
 
@@ -162,3 +165,202 @@ From the Stage-2 execution plan, still closed:
 - rollback readiness.
 
 This qualification does not open those gates.
+
+## Lifecycle run
+
+Run `36983458658` (2026-10-02) is the first isolated run that moved a
+synthetic transaction through Merkle to `MINED`. It does not replace the
+blocked run above.
+
+The idle Compose stack and the lifecycle process are different. Compose
+starts the provenance image, proves the private callback, and then stops.
+The lifecycle runs in the end-to-end harness from the same commit: Merkle
+v0.4.5 in a container, an in-process libp2p host, and an in-process
+synthetic DataHub. The provenance container is not the process that mined.
+
+### Merkle image
+
+`expectedSubtreeIndices` is present in merkle-service v0.4.5
+(`internal/callback/delivery.go`, attached from the tracked subtree set in
+`emitBlockProcessedCallbacks`). That is the minimum release used here.
+v0.4.5 is a single linux/amd64 manifest. The pin is the manifest digest,
+not the tag. The end-to-end default pin stays on v0.2.5. Production Merkle
+configuration is unchanged.
+
+The v0.4.5 environment surface used by this stack matches the existing
+harness: mode, SQL store, Kafka, regtest with DHT off, and explicit
+private-IP callback and DataHub flags. No new setting was required.
+`BLOB_STORE_URL` stays quoted as `"memory:"`.
+
+```text
+MERKLE_VERSION=v0.4.5
+MERKLE_IMAGE_DIGEST=sha256:8393a456cac5f5bf24537b519d82a4d96fded0b43005fa0412a7545e43ecf168
+EXPECTED_SUBTREE_INDICES_SUPPORTED=YES
+```
+
+### Local chain
+
+The chain is the harness synthetic regtest path, not a new node. Regtest
+has no built-in public bootstrap peers. The block is fabricated with
+`BuildSyntheticBlock` (seven synthetic transactions plus a coinbase, one
+subtree) and announced by the harness libp2p host. Merkle fetches the block
+and subtree from the harness DataHub. A coinbase-only block is built with
+`BuildEmptySyntheticBlock`.
+
+v0.4.5 leaves the coinbase placeholder in the STUMP. The synthetic block
+now carries the coinbase left-spine proof so Arcade can fold that
+placeholder into the header root. Without it, the compound root stayed the
+placeholder tree and Arcade refused to persist `MINED`.
+
+```text
+LOCAL_CHAIN_BACKEND=synthetic regtest harness
+LOCAL_CHAIN_ISOLATION=regtest, synthetic keys, no public chain
+BLOCK_PRODUCTION=harness libp2p announcement of a fabricated block
+MERKLE_CHAIN_CONNECTION=P2P regtest, DHT off, harness DataHub
+```
+
+### Public peers
+
+Compose sets `network: regtest`, `chaintracks_server.enabled: false`,
+`p2p.dht_mode: off`, and an empty bootstrap list. The probe found no
+`bsvb.tech` or `dnsaddr` dial in the Compose logs.
+
+```text
+EXTERNAL_BOOTSTRAP_CONNECTIONS=0
+```
+
+The lifecycle process enables chaintracks and points it only at the harness
+loopback peer. Its bootstrap list is empty. One isolated peer does not emit
+`SEEN_MULTIPLE_NODES`. That status was not observed.
+
+### Registration
+
+Txid `d740b91e7aa578ef30cdba66d9ace3bf1eaf590522788e4ba1fa23dce6407abe`.
+
+The harness held the DataHub broadcast until Merkle `GET /api/lookup/<txid>`
+showed the callback URL. Arcade logged `registered with merkle-service` at
+`2026-10-02T08:24:24.854Z` and `transactions accepted by network` at
+`2026-10-02T08:24:24.857Z`. The lookup callback path was
+`/api/v1/merkle-service/callback`.
+
+```text
+MERKLE_REGISTRATION=PASS
+```
+
+The lifecycle callback host is the harness proxy (`host.docker.internal`),
+not `votari-arcade`. The Compose callback remains
+`http://votari-arcade:8080/api/v1/merkle-service/callback`, with both ports
+unpublished. Probe authentication on that route:
+
+```text
+PRIVATE_CALLBACK_HOST_PORT=unpublished
+MERKLE_HOST_PORT=unpublished
+CALLBACK_MISSING_BEARER=401
+CALLBACK_WRONG_BEARER=401
+CALLBACK_CORRECT_BEARER=200
+SECRET_IN_LOGS=absent
+```
+
+### expectedSubtreeIndices
+
+Block `7051d0e33e52cd291ded10b5d2832f2cc0aea9513c362e930702819743f3ee61`
+contained the tracked transactions. Its `BLOCK_PROCESSED` body included
+`expectedSubtreeIndices: [0]`. The harness withheld that STUMP. At
+`2026-10-02T08:24:28.220Z` the bump builder logged the missing index 0 and
+did not finalize. `processedAt` was still empty.
+
+After the STUMP was delivered, at `2026-10-02T08:24:29.794Z` the builder
+logged the expected set complete (1 of 1) and skipped the grace window.
+
+The coinbase-only block
+`5e0ca2c9477aa18bdf8af7de485a42ea88adb9b834f91952283b3d2294374ae6` did not
+carry `expectedSubtreeIndices`. The builder treated it as zero STUMPs. Its
+processing status moved from 404 to 200, and `processedAt` was set.
+
+```text
+EXPECTED_SUBTREE_INDICES_CONTRACT=PASS
+```
+
+### Observed lifecycle
+
+Polled statuses, in order: `RECEIVED`, `ACCEPTED_BY_NETWORK`,
+`SEEN_ON_NETWORK`, `MINED`. `SENT_TO_NETWORK` was not seen by the poll.
+`SEEN_MULTIPLE_NODES` was not emitted.
+
+```text
+2026-10-02T08:24:24.798Z  RECEIVED
+2026-10-02T08:24:24.857Z  ACCEPTED_BY_NETWORK
+2026-10-02T08:24:27.718Z  SEEN_ON_NETWORK
+2026-10-02T08:24:27.720Z  BLOCK_PROCESSED (STUMP withheld, processedAt unset)
+2026-10-02T08:24:29.783Z  STUMP stored (subtree 0)
+2026-10-02T08:24:29.798Z  MINED (7 transactions, height 1)
+```
+
+`MINED` is the durable status of the tracked txid on that block.
+
+### Restart
+
+Arcade was restarted after the withheld-STUMP `BLOCK_PROCESSED` and before
+the STUMP was delivered. Chaintracks reopened at height 1. The tracker
+reloaded 7 transactions. The Merkle watch for the tracked txid was still
+present. `processedAt` was still empty. A replay of the same
+`BLOCK_PROCESSED` after `MINED` left the status `MINED` on the same block.
+The poll recorded `MINED` once. A second same-block mine write at
+`2026-10-02T08:24:30.019Z` did not add a second status observation.
+
+```text
+RESTART_RECOVERY=PASS
+```
+
+### Fault injection
+
+No runtime fault hook was added. A production binary must not gain a debug
+endpoint for this test. The SEEN HTTP 500 retry and the `SetMinedByTxIDs`
+`store_failed` path stay covered by the in-process durability tests.
+
+The missing-STUMP case above was recovered by an explicit Merkle
+`/reprocess`, which is the call the watchdog would make. The in-process
+watchdog timer was not running, and a failed `SetMinedByTxIDs` was not
+injected.
+
+```text
+RUNTIME_FAULT_INJECTION=NOT_IMPLEMENTED
+SEEN_CALLBACK_RETRY=BLOCKED
+MINED_WATCHDOG_RECOVERY=BLOCKED
+```
+
+### Provenance
+
+The image and the harness that executed this run are the same commit.
+`local_image_id` is not a registry digest. The image was not pushed.
+
+```text
+ARCADE_IMAGE_SOURCE_SHA=d127b6fd06f9242d350d181a595a438f7973cff7
+QUALIFICATION_HARNESS_SHA=d127b6fd06f9242d350d181a595a438f7973cff7
+OCI_REVISION=d127b6fd06f9242d350d181a595a438f7973cff7
+OCI_SOURCE=https://github.com/ruidasilva/arcade
+OCI_CREATED=2026-10-02T08:21:11Z
+GO_VCS_REVISION=d127b6fd06f9242d350d181a595a438f7973cff7
+GO_VCS_MODIFIED=false
+LOCAL_IMAGE_ID=sha256:473db83867b82663d48320676db2443c49c2039b576915312afc924c8dbe9c88
+REGISTRY_MANIFEST_DIGEST=none
+SBOM=sbom.spdx.json SPDX-2.3 name=arcade packages=305
+SBOM_SHA256=0fb09d4ecc82597e6a1bc290c445ba000be552e9465eb586ea19afe6a7a82b1f
+MERKLE_VERSION=v0.4.5
+MERKLE_IMAGE_DIGEST=sha256:8393a456cac5f5bf24537b519d82a4d96fded0b43005fa0412a7545e43ecf168
+```
+
+`go test -count=1 ./...` passed on this tree. That command does not compile
+the `e2e` build tag. The lifecycle test passed separately as
+`TestStage2_IsolatedLifecycle` in run `36983458658`.
+
+### Verdict
+
+```text
+ARCADE MERKLE STAGE2 ISOLATED QUALIFICATION: PASS
+```
+
+`PASS` means one tracked synthetic transaction reached `MINED` on the
+isolated chain. It does not enable production Merkle. The SEEN retry and
+the mined-store watchdog were not injected at runtime. The production gates
+from the first run stay closed.
