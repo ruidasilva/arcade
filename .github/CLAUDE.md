@@ -26,3 +26,7 @@ If you encounter conflicting guidance elsewhere, `AGENTS.md` wins.
 Questions or ambiguities? Open a discussion or ping a maintainer instead of guessing.
 
 Happy hacking!
+
+## Votari integration terminology
+
+Apply the Votari terminology and responsibility boundaries in `AGENTS.md`. This fork-specific clarification preserves upstream governance and leaves unconfirmed operational ownership TO CONFIRM.
