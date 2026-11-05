@@ -20,3 +20,7 @@ All contributors must read `.github/AGENTS.md` for complete guidelines. If any r
   2. **Why It Was Necessary**
   3. **Testing Performed**
   4. **Impact / Risk**
+
+## Votari integration terminology
+
+Apply the Votari terminology and responsibility boundaries in `.github/AGENTS.md`. This fork-specific clarification preserves upstream governance and leaves unconfirmed operational ownership TO CONFIRM.
