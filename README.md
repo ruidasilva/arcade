@@ -116,6 +116,68 @@
 </table>
 <br/>
 
+## Votari integration — VCES service ownership
+
+This repository is Votari's maintained fork of the BSV Association Arcade project (now named **BSV Broadcaster** upstream). Existing Votari-approved changes on the fork are part of its baseline. This section documents the Votari service boundary; it does not describe upstream contributions as unmerged Votari work or claim the fork HEAD is the deployed revision.
+
+```mermaid
+flowchart TB
+    Apps["Votari clients: Mobile / VEO / Assembly Voter"]
+    subgraph VCES["VCES — Core Election Services"]
+      BA["GoBA · ballot allocation"]
+      FD["GoFD · fee sponsorship"]
+      MW["Middleware · index / query"]
+      AR["Arcade · broadcast / status"]
+      PS["Merkle Proof Store · proof infrastructure (integration pending evidence)"]
+    end
+    Apps -.-> BA
+    Apps -.-> FD
+    Apps -.-> MW
+    Apps -.-> AR
+    Apps -.-> PS
+    subgraph VTS["VTS — Treasury Services"]
+      TR["Treasury Rehydrator"]
+    end
+    TR --> FR[("GoFD Redis fee pools")]
+    FD --> FR
+    BA --> BR[("GoBA Redis")]
+    MW --> MR[("Middleware Redis")]
+    class AR active
+    classDef active fill:#167344,color:#fff,stroke:#105b35
+```
+
+Green highlights Arcade. The diagram is a **logical responsibility map**, not network topology. The VTS Treasury Rehydrator is a separately deployed treasury service, not a fifth ballot execution component. The Merkle Proof Store is a separate proof-evidence R&D repository: its draft PR #1 contains a scaffold and implementation plan, and live Votari integration is not yet verified.
+
+### Arcade's operational boundary
+
+```mermaid
+flowchart TD
+    Clients["GoBA / GoFD / application clients"] --> API["Arcade transaction API"]
+    API --> Validation["Validate / admit transaction"]
+    Validation --> Network["Teranode network submission"]
+    Network --> Status["Transaction status lifecycle"]
+    Status --> Events["Arcade event / Kafka bridge"]
+    Events --> Index["JungleBus Middleware ingest and Redis index"]
+    Status -.-> Proof["Merkle Service proof lifecycle"]
+    Proof -.-> Store["Merkle Proof Store (planned retention integration)"]
+```
+
+The dashed proof-store connection is **planned**, not a confirmed production link. The existing Merkle lifecycle is governed by Arcade and its configured Merkle Service; no new proof generation is authorized by this diagram.
+
+### Companion repositories
+
+| Service | Role |
+| --- | --- |
+| [GoBA](https://github.com/ruidasilva/votari-ballot-allocator-go) | Ballot allocation and funding |
+| [GoFD](https://github.com/ruidasilva/bsv-fee-delegator-go) | Fee UTXO sponsorship and signing |
+| [JungleBus Middleware](https://github.com/ruidasilva/junglebus_middleware) | Indexing and blockchain evidence queries |
+| [Votari Arcade fork](https://github.com/ruidasilva/arcade) / [BSV Broadcaster upstream](https://github.com/bsv-blockchain/broadcaster) | Broadcast, network status and event lifecycles |
+| [Merkle Proof Store](https://github.com/ruidasilva/bitcoin-merkle-proof-store-go) | Independent proof retention; draft local implementation, not production-verified |
+| [Treasury Rehydrator — VTS](https://github.com/ruidasilva/votari-treasury-fanout) | Treasury fanout and fee-pool replenishment |
+
+Source and production are distinct: do not update or redeploy Votari Arcade from an upstream ref without a separate compatibility review and founder approval. Follow [Votari Existing-Work-First governance](https://github.com/ruidasilva/votari-infrastructure-operations/blob/main/governance/EXISTING_WORK_FIRST_ENGINEERING_GATE.md). Do not alter upstream's original technical documentation or licenses when reconciling Votari ownership.
+
+
 ## 📦 Installation
 
 **arcade** requires a [supported release of Go](https://golang.org/doc/devel/release.html#policy).
