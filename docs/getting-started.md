@@ -134,9 +134,14 @@ transaction lifecycle forward via callbacks
 (`SEEN_ON_NETWORK` → `MINED` → `IMMUTABLE`).
 
 **If `merkle_service.url` is left empty, arcade still accepts and broadcasts
-transactions, but every row stays at `RECEIVED` forever** — no callback source
-means nothing advances the state machine. Configure Merkle Service whenever
-you want real status progression.
+transactions.** Teranode acceptance is stored as `ACCEPTED_BY_NETWORK`. A
+Teranode rejection is stored as `REJECTED`. An unreachable peer leaves the
+row non-terminal and retries. Empty configuration does not invent either
+status: nothing is marked accepted or mined until a network response or a
+separate proof source says so. `SEEN_ON_NETWORK`, `MINED`, and the
+transaction merkle path still require a callback or another proof provider.
+Configure Merkle Service when you want those callbacks from a service you
+operate.
 
 ### Public Merkle Service endpoints
 
@@ -219,8 +224,10 @@ curl http://localhost:8080/tx/<txid>
 
 ## Common next steps
 
-- **Enable Merkle Service callbacks** — without this, all transactions stay
-  at `RECEIVED`. See the [Merkle Service](#merkle-service) section above.
+- **Enable Merkle Service callbacks** when you want `SEEN_ON_NETWORK` and
+  mined merkle proofs from a service you operate. Broadcasting and
+  `ACCEPTED_BY_NETWORK` do not require it. See the
+  [Merkle Service](#merkle-service) section above.
 - **Use embedded PostgreSQL instead of Pebble** — uncomment the alternative
   `store:` block in [`config.example.standalone.yaml`](../config.example.standalone.yaml).
   The first run extracts the postgres binary, which takes a few seconds.

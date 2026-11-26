@@ -1328,7 +1328,9 @@ func (p *Propagator) flushBatch(ctx context.Context) error {
 // can requeue them through the dispatcher after a short flat wait.
 //
 // When the merkle integration is disabled (client nil or no callback URL),
-// every tx is treated as registered.
+// every tx is passed through to broadcast. That pass-through writes no
+// status. ACCEPTED_BY_NETWORK and REJECTED still come only from the Teranode
+// verdict. This function never writes SEEN_ON_NETWORK or MINED.
 func (p *Propagator) registerBatch(ctx context.Context, batch []propagationMsg) (registered, failed []propagationMsg) {
 	if p.merkleClient == nil || p.cfg.CallbackURL == "" {
 		return batch, nil
